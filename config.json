@@ -1,0 +1,8 @@
+{
+    "server_url": "http://217.71.129.139:5909",
+    "device_id": "NSTU_1-Floor_Hall",
+    "token": "ZxI9U1jH0ZuA-6mZW0eAGap9_pbfty4DF15GDt1SOZjJEer5Cky1PAw7C8laOQry",
+    "media_dir": "./content",
+    "heartbeat_interval": 30,
+    "check_videos_interval": 60
+}
