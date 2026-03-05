@@ -227,32 +227,80 @@ def check_videos(config):
         print(f"[CheckVideos {now}] Error: {e}")
 
 
-def main():
-    if not os.path.exists(CONFIG_FILE):
-        print(f"Файл {CONFIG_FILE} не найден!")
-        return
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.attributes('-fullscreen', True)
+        self.root.configure(background='black')
+        self.root.config(cursor="none")
+        self.root.withdraw() # По умолчанию скрыто
+        
+        self.config = load_config()
+        self.last_hb = 0
+        self.last_check = 0
 
-    config = load_config()
-    last_hb = 0
-    last_check = 0
+    def show_curtain(self):
+        self.root.deiconify()
+        self.root.update()
 
-    print(f"--- Клиент запущен (ID: {config['device_id']}) ---")
+    def hide_curtain(self):
+        self.root.withdraw()
+        self.root.update()
 
-    while True:
-        now = time.time()
+    def worker_loop(self):
+        """Фоновый поток для работы с API и скачивания"""
+        while True:
+            now_ts = time.time()
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Heartbeat по таймеру
-        if now - last_hb > config.get('heartbeat_interval', 30):
-            heartbeat(config)
-            last_hb = now
+            # Heartbeat
+            if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
+                heartbeat(self.config)
+                self.last_hb = now_ts
 
-        # Проверка видео по таймеру
-        if now - last_check > config.get('check_videos_interval', 60):
-            check_videos(config)
-            last_check = now
+            # Check Videos
+            if now_ts - self.last_check > self.config.get('check_videos_interval', 60):
+                self.process_check_videos(now_str)
+                self.last_check = now_ts
 
-        time.sleep(1)
+            time.sleep(1)
+
+    def process_check_videos(self, now_str):
+        url = f"{self.config['server_url']}/api/check-videos"
+        current_ids = get_local_video_ids(self.config['media_dir'])
+        payload = {"token": self.config['token'], "id": self.config['device_id'], "videos": current_ids}
+
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            data = resp.json()
+            if data.get("status") == 205:
+                print(f"[{now_str}] Обновление контента...")
+                
+                self.root.after(0, self.show_curtain)
+                
+                stop_player()
+                download_content(data.get("videos", []), self.config['media_dir'])
+                start_player(self.config['media_dir'])
+                
+                time.sleep(3) 
+                self.root.after(0, self.hide_curtain)
+            
+            elif data.get("status") == 204:
+                global player_process
+                if player_process is None or player_process.poll() is not None:
+                    start_player(self.config['media_dir'])
+
+        except Exception as e:
+            print(f"[{now_str}] Ошибка check_videos: {e}")
+
+    def run(self):
+        # Запускаем логику в отдельном потоке
+        t = threading.Thread(target=self.worker_loop, daemon=True)
+        t.start()
+        # Запускаем Tkinter в главном потоке
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.run()
