@@ -61,6 +61,32 @@ def start_player(media_dir):
         print(f"[Player {now}] Ошибка запуска mpv: {e}")
 
 
+def show_black_screen():
+    """Выводит черное изображение на весь экран, перекрывая всё."""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        # -T 1: использовать первый терминал
+        # -noverbose: убрать текстовые подписи снизу
+        # -a: автоматическое масштабирование
+        subprocess.run([
+            "sudo", "fbi", "-d", "/dev/fb0", "-T", "1", 
+            "-noverbose", "-a", "/home/jetson/black.png"
+        ], check=True)
+        print(f"[System {now}] Экран скрыт (черный фон).")
+    except Exception as e:
+        print(f"[Error {now}] Не удалось запустить fbi: {e}")
+
+
+def hide_black_screen():
+    """Убивает процесс fbi, возвращая видимость плеера."""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        subprocess.run(["sudo", "killall", "-9", "fbi"], stderr=subprocess.DEVNULL)
+        print(f"[System {now}] Экран разблокирован.")
+    except:
+        pass
+
+
 def load_config():
     with open(CONFIG_FILE, 'r') as f:
         return json.load(f)
@@ -175,9 +201,11 @@ def check_videos(config):
         status = data.get("status")
         if status == 205:
             print(f"[! {now}] Контент не актуален. Запуск обновления...")
+            show_black_screen()
             stop_player()
             download_content(data.get("videos", []), config['media_dir'])
             start_player(config['media_dir'])
+            hide_black_screen()
         elif status == 204:
             global player_process
             if player_process is None or player_process.poll() is not None:
