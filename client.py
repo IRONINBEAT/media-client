@@ -3,6 +3,8 @@ import json
 import time
 import subprocess
 import requests
+import tkinter as tk
+import threading
 from datetime import datetime
 import signal
 from urllib.parse import urlparse
@@ -10,6 +12,38 @@ from urllib.parse import urlparse
 CONFIG_FILE = 'config.json'
 # Глобальная переменная для хранения процесса плеера
 player_process = None
+
+
+class BlackCurtain:
+    def __init__(self):
+        self.root = None
+        self.thread = None
+
+    def _create_window(self):
+        self.root = tk.Tk()
+        self.root.attributes('-fullscreen', True)
+        self.root.configure(background='black')
+        self.root.config(cursor="none")
+        self.root.bind("<Escape>", lambda e: self.stop())
+        self.root.mainloop()
+
+    def start(self):
+        """Запуск черного окна в отдельном потоке."""
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._create_window, daemon=True)
+        self.thread.start()
+        time.sleep(1)
+
+    def stop(self):
+        """Закрытие черного окна."""
+        if self.root:
+            self.root.after(0, self.root.destroy)
+            self.thread.join()
+            self.root = None
+
+
+curtain = BlackCurtain()
 
 
 def stop_player():
@@ -59,32 +93,6 @@ def start_player(media_dir):
         )
     except Exception as e:
         print(f"[Player {now}] Ошибка запуска mpv: {e}")
-
-
-def show_black_screen():
-    """Выводит черное изображение на весь экран, перекрывая всё."""
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        # -T 1: использовать первый терминал
-        # -noverbose: убрать текстовые подписи снизу
-        # -a: автоматическое масштабирование
-        subprocess.run([
-            "sudo", "fbi", "-d", "/dev/fb0", "-T", "1", 
-            "-noverbose", "-a", "/home/jetson/black.png"
-        ], check=True)
-        print(f"[System {now}] Экран скрыт (черный фон).")
-    except Exception as e:
-        print(f"[Error {now}] Не удалось запустить fbi: {e}")
-
-
-def hide_black_screen():
-    """Убивает процесс fbi, возвращая видимость плеера."""
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        subprocess.run(["sudo", "killall", "-9", "fbi"], stderr=subprocess.DEVNULL)
-        print(f"[System {now}] Экран разблокирован.")
-    except:
-        pass
 
 
 def load_config():
@@ -201,11 +209,12 @@ def check_videos(config):
         status = data.get("status")
         if status == 205:
             print(f"[! {now}] Контент не актуален. Запуск обновления...")
-            show_black_screen()
+            curtain.start()
             stop_player()
             download_content(data.get("videos", []), config['media_dir'])
             start_player(config['media_dir'])
-            hide_black_screen()
+            time.sleep(3)
+            curtain.stop()
         elif status == 204:
             global player_process
             if player_process is None or player_process.poll() is not None:
