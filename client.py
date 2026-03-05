@@ -13,26 +13,26 @@ player_process = None
 
 
 def stop_player():
-    """Остановка плеера, если он запущен."""
+    """Остановка cvlc."""
     global player_process
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if player_process:
         try:
-            # Отправляем сигнал завершения группе процессов
+            # Убиваем всю группу процессов vlc
             os.killpg(os.getpgid(player_process.pid), signal.SIGTERM)
             player_process = None
-            print(f"[Player {now}] Предыдущий процесс плеера остановлен.")
+            print(f"[Player {now}] Процесс cvlc остановлен.")
         except Exception as e:
-            print(f"[Player {now}] Ошибка при остановке плеера: {e}")
+            print(f"[Player {now}] Ошибка при остановке: {e}")
 
 
 def start_player(media_dir):
-    """Запуск цикличного воспроизведения всех файлов в папке."""
+    """Запуск цикличного воспроизведения всех файлов в папке через cvlc."""
     global player_process
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # Получаем список всех файлов в директории
+    # Получаем список всех файлов
     files = [os.path.join(media_dir, f) for f in os.listdir(media_dir) 
              if os.path.isfile(os.path.join(media_dir, f))]
 
@@ -40,17 +40,17 @@ def start_player(media_dir):
         print(f"[Player {now}] Нет файлов для воспроизведения.")
         return
 
-    print(f"[Player {now}] Запуск воспроизведения {len(files)} файлов.")
+    print(f"[Player {now}] Запуск CVLC: {len(files)} файлов.")
 
-    # Команда mpv:
-    # --fs: полноэкранный режим
-    # --loop-playlist: крутить список бесконечно
-    # --no-osc: убрать элементы управления с экрана
-    # --no-input-default-bindings: отключить реакцию на клавиатуру
-    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio"] + files
+    # Формируем команду для cvlc
+    # --fullscreen: во весь экран
+    # --loop: крутить плейлист бесконечно
+    # --no-video-title-show: не показывать название файла при старте
+    # --no-osd: убрать значки громкости/паузы
+    cmd = ["cvlc", "--fullscreen", "--loop", "--no-video-title-show", "--no-osd"] + files
 
     try:
-        # Запускаем в новой группе процессов, чтобы удобно было убивать
+        # Используем os.setsid, чтобы можно было убить дерево процессов VLC
         player_process = subprocess.Popen(
             cmd, 
             stdout=subprocess.DEVNULL, 
@@ -58,7 +58,7 @@ def start_player(media_dir):
             preexec_fn=os.setsid 
         )
     except Exception as e:
-        print(f"[Player {now}] Ошибка запуска mpv: {e}")
+        print(f"[Player {now}] Ошибка запуска cvlc: {e}")
 
 
 def load_config():
