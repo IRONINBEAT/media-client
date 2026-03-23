@@ -263,10 +263,7 @@ class App:
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
             self.root.after(0, self.hide_curtain)
-            start_player(
-                self.config['media_dir'],
-                image_duration=self.config.get('image_display_duration', 5)
-            )
+            start_player(self.config['media_dir'])
 
     def worker_loop(self):
         """Фоновый поток для работы с API и скачивания"""
