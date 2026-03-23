@@ -196,20 +196,40 @@ def sync_token(config):
 
 
 def heartbeat(config):
-    """Уведомление сервера о том, что устройство в сети."""
+    """Уведомление сервера о том, что устройство в сети.
+
+    Возможные значения status в ответе:
+      "actual"  — токен актуален, всё хорошо
+      "updated" — сервер принял старый токен и выдал новый (один шанс)
+      None      — токен недействителен (уже обновлён или неверный)
+    """
     url = f"{config['server_url']}/api/heartbeat"
     payload = {"token": config['token'], "id": config['device_id']}
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        try:
-            data = resp.json()
-            status = data.get("status", resp.status_code)
-        except Exception:
-            status = resp.status_code
-        print(f"[Heartbeat {now}] Status: {status}")
-        return status
+        data = resp.json()
+        status = data.get("status")
+        success = data.get("success")
+        message = data.get("message", "")
+        print(f"[Heartbeat {now}] success={success} status={status} msg={message}")
+
+        if status == "updated":
+            # Сервер дал новый токен — сохраняем и продолжаем работу
+            new_token = data.get("new_token")
+            if new_token:
+                config['token'] = new_token
+                save_config(config)
+                print(f"[* {now}] Токен обновлён через heartbeat: {new_token}")
+            return "ok"
+
+        if status == "actual":
+            return "ok"
+
+        # success=false — токен полностью недействителен, нужен sync-token
+        return "invalid"
+
     except Exception as e:
         print(f"[Heartbeat {now}] Error: {e}")
         return None
@@ -313,13 +333,13 @@ class App:
                 status = heartbeat(self.config)
                 self.last_hb = now_ts
 
-                if status == 403:
-                    self.handle_blocked()
-                elif status == 401:
-                    sync_token(self.config)
-                elif status is not None and str(status).startswith('2'):
-                    # Успешный ответ — снимаем блок если был
+                if status == "ok":
+                    # Токен валиден — снимаем блок если был
                     self.handle_unblocked()
+                elif status == "invalid":
+                    # Токен полностью протух — пробуем sync-token
+                    sync_token(self.config)
+                # None — сервер недоступен, ничего не делаем
 
             # check-videos пропускаем пока устройство заблокировано
             if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
@@ -363,7 +383,9 @@ class App:
 
             elif data.get("status") == 401:
                 sync_token(self.config)
-            # 403 не обрабатываем здесь — worker_loop поймает через heartbeat
+            elif data.get("status") == 403:
+                # Устройство заблокировано — блокируем воспроизведение
+                self.handle_blocked()
 
         except Exception as e:
             print(f"[{now_str}] Ошибка check_videos: {e}")
