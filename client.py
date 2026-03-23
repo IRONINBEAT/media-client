@@ -203,13 +203,16 @@ def heartbeat(config):
 
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
-        print(f"[Heartbeat {now}] Status: {data.get('status')} ({data.get('message')})")
-
-        if data.get("status") in [401, 403]:
-            sync_token(config)
+        try:
+            data = resp.json()
+            status = data.get("status", resp.status_code)
+        except Exception:
+            status = resp.status_code
+        print(f"[Heartbeat {now}] Status: {status}")
+        return status
     except Exception as e:
         print(f"[Heartbeat {now}] Error: {e}")
+        return None
 
 
 def download_content(videos, media_dir):
@@ -263,6 +266,7 @@ class App:
         self.config = load_config()
         self.last_hb = 0
         self.last_check = 0
+        self.is_blocked = False
 
     def show_curtain(self):
         self.root.deiconify()
@@ -272,6 +276,33 @@ class App:
         self.root.withdraw()
         self.root.update()
 
+    def handle_blocked(self):
+        """Устройство заблокировано — останавливаем плеер и показываем чёрный экран."""
+        if not self.is_blocked:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[! {now}] Устройство заблокировано. Остановка воспроизведения.")
+            self.is_blocked = True
+            stop_player()
+            self.root.after(0, self.show_curtain)
+
+    def handle_unblocked(self):
+        """Устройство разблокировано — запускаем плеер, затем скрываем чёрный экран."""
+        if self.is_blocked:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
+            self.is_blocked = False
+            start_player(
+                self.config['media_dir'],
+                image_duration=self.config.get('image_display_duration', 5)
+            )
+            time.sleep(2)
+            self.root.after(0, self.hide_curtain)
+
+    def shutdown(self, *_):
+        """Корректное завершение по Ctrl+C / SIGTERM."""
+        stop_player()
+        self.root.after(0, self.root.destroy)
+
     def worker_loop(self):
         """Фоновый поток для работы с API и скачивания."""
         while True:
@@ -279,10 +310,19 @@ class App:
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
             if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
-                heartbeat(self.config)
+                status = heartbeat(self.config)
                 self.last_hb = now_ts
 
-            if now_ts - self.last_check > self.config.get('check_videos_interval', 60):
+                if status == 403:
+                    self.handle_blocked()
+                elif status == 401:
+                    sync_token(self.config)
+                elif status is not None and str(status).startswith('2'):
+                    # Успешный ответ — снимаем блок если был
+                    self.handle_unblocked()
+
+            # check-videos пропускаем пока устройство заблокировано
+            if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
                 self.process_check_videos(now_str)
                 self.last_check = now_ts
 
@@ -321,13 +361,21 @@ class App:
                         image_duration=self.config.get('image_display_duration', 5)
                     )
 
-            elif data.get("status") in [401, 403]:
+            elif data.get("status") == 401:
                 sync_token(self.config)
+            # 403 не обрабатываем здесь — worker_loop поймает через heartbeat
 
         except Exception as e:
             print(f"[{now_str}] Ошибка check_videos: {e}")
 
     def run(self):
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
+
+        def _poll():
+            self.root.after(200, _poll)
+        _poll()
+
         t = threading.Thread(target=self.worker_loop, daemon=True)
         t.start()
         self.root.mainloop()
