@@ -279,16 +279,18 @@ class App:
             self.root.after(0, self.show_curtain)
 
     def handle_unblocked(self):
-        """Устройство разблокировано — скрываем экран и запускаем плеер."""
+        """Устройство разблокировано — запускаем плеер, затем скрываем чёрный экран."""
         if self.is_blocked:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
-            self.root.after(0, self.hide_curtain)
+            # Сначала запускаем плеер, ждём пока откроется, потом убираем штору
             start_player(
                 self.config['media_dir'],
                 image_duration=self.config.get('image_display_duration', 5)
             )
+            time.sleep(2)
+            self.root.after(0, self.hide_curtain)
 
     def shutdown(self, *_):
         """Корректное завершение по Ctrl+C / SIGTERM."""
