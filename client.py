@@ -311,6 +311,7 @@ class App:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
+            self.last_check = 0
             start_player(
                 self.config['media_dir'],
                 image_duration=self.config.get('image_display_duration', 5)
