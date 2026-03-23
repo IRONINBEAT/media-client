@@ -188,6 +188,10 @@ def heartbeat(config):
         if status == 403 or status == "403" or str(status) == "403":
             return "blocked"
 
+        # Токен недействителен (unauthorized)
+        if status == 401 or status == "401" or str(status) == "401":
+            return "unauthorized"
+
         # Любой признак успеха: "actual", 200, success=True
         if status == "actual" or status == 200 or success is True:
             return "ok"
@@ -289,9 +293,14 @@ class App:
 
                 if status == "blocked":
                     self.handle_blocked()
+                elif status == "unauthorized":
+                    # Останавливаем воспроизведение и пробуем обновить токен
+                    self.handle_blocked()
+                    sync_token(self.config)
                 elif status == "ok":
                     self.handle_unblocked()
                 elif status == "invalid":
+                    self.handle_blocked()
                     sync_token(self.config)
                 # None — сервер недоступен, ждём следующего heartbeat
 
