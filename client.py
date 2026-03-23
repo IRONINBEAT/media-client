@@ -196,9 +196,14 @@ def heartbeat(config):
 
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
-        print(f"[Heartbeat {now}] Status: {data.get('status')} ({data.get('message')})")
-        return data.get("status")
+        # Пробуем разобрать JSON — сервер может вернуть статус внутри тела
+        try:
+            data = resp.json()
+            status = data.get("status", resp.status_code)
+        except Exception:
+            status = resp.status_code
+        print(f"[Heartbeat {now}] Status: {status}")
+        return status
     except Exception as e:
         print(f"[Heartbeat {now}] Error: {e}")
         return None
@@ -312,8 +317,8 @@ class App:
                     self.handle_blocked()
                 elif status == 401:
                     sync_token(self.config)
-                elif status is not None:
-                    # Сервер отвечает нормально — снимаем блок если был
+                elif status is not None and str(status).startswith('2'):
+                    # Сервер отвечает нормально (2xx) — снимаем блок если был
                     self.handle_unblocked()
 
             # Check Videos — пропускаем, если устройство заблокировано
