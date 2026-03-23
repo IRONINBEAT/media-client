@@ -76,8 +76,6 @@ def start_player(media_dir, image_duration=5):
     Порядок воспроизведения: алфавитный (страницы PDF идут по порядку).
     """
     global player_process
-    stop_player()
-    time.sleep(0.5)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     files = sorted([
@@ -313,7 +311,6 @@ class App:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
-            self.last_check = 0
             start_player(
                 self.config['media_dir'],
                 image_duration=self.config.get('image_display_duration', 5)
@@ -327,30 +324,27 @@ class App:
         self.root.after(0, self.root.destroy)
 
     def worker_loop(self):
+        """Фоновый поток для работы с API и скачивания."""
         while True:
             now_ts = time.time()
-            
-            # 1. Heartbeat (проверка блокировки)
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
             if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
                 status = heartbeat(self.config)
                 self.last_hb = now_ts
+
                 if status == "ok":
+                    # Токен валиден — снимаем блок если был
                     self.handle_unblocked()
                 elif status == "invalid":
+                    # Токен полностью протух — пробуем sync-token
                     sync_token(self.config)
+                # None — сервер недоступен, ничего не делаем
 
-            # 2. Проверка видео (только если НЕ заблокировано)
-            if not self.is_blocked:
-                # Если плеер упал (процесс None или завершился), запускаем его не дожидаясь таймера
-                global player_process
-                player_died = player_process is None or player_process.poll() is not None
-                
-                time_to_check = now_ts - self.last_check > self.config.get('check_videos_interval', 60)
-                
-                if player_died or time_to_check:
-                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    self.process_check_videos(now_str)
-                    self.last_check = now_ts
+            # check-videos пропускаем пока устройство заблокировано
+            if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
+                self.process_check_videos(now_str)
+                self.last_check = now_ts
 
             time.sleep(1)
 
