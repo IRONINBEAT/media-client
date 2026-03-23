@@ -9,11 +9,14 @@ import tkinter as tk
 import threading
 from datetime import datetime
 import signal
-import sys
 from urllib.parse import urlparse
 
 CONFIG_FILE = 'config.json'
 player_process = None
+
+# Расширения, которые поддерживаются напрямую mpv
+VIDEO_EXTS = {'.mp4', '.avi', '.mkv', '.mov'}
+IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}
 
 # Паттерн имён файлов, полученных из PDF: {file_id}_p-001.png
 PDF_PAGE_RE = re.compile(r'^(.+)_p-\d+\.png$')
@@ -87,10 +90,13 @@ def start_player(media_dir, image_duration=5):
 
     print(f"[Player {now}] Запуск воспроизведения {len(files)} файлов.")
 
-    # --image-display-duration: время показа каждого фото/слайда PDF (сек.)
     cmd = [
-        "mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio",
-        f"--image-display-duration={image_duration}",
+        "mpv",
+        "--fs",
+        "--loop-playlist",
+        "--no-osc",
+        "--no-audio",
+        f"--image-display-duration={image_duration}",  # время показа каждого фото/слайда (сек.)
     ] + files
 
     try:
@@ -131,7 +137,7 @@ def get_local_file_ids(media_dir):
             continue
         m = PDF_PAGE_RE.match(filename)
         if m:
-            ids.add(m.group(1))  # извлекаем исходный file_id
+            ids.add(m.group(1))   # извлекаем исходный file_id
         else:
             ids.add(os.path.splitext(filename)[0])
     return list(ids)
@@ -145,6 +151,7 @@ def convert_pdf_to_images(pdf_path, file_id, media_dir):
     Исходный PDF удаляется после конвертации.
     """
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # pdftoppm добавит суффикс -001.png, -002.png и т.д.
     prefix = os.path.join(media_dir, f"{file_id}_p")
 
     try:
@@ -161,7 +168,7 @@ def convert_pdf_to_images(pdf_path, file_id, media_dir):
     except subprocess.CalledProcessError as e:
         print(f"[! {now}] Ошибка конвертации PDF {file_id}: {e}")
     finally:
-        # Удаляем исходный PDF — он не нужен плееру
+        # Удаляем исходный PDF в любом случае — он не нужен плееру
         try:
             os.remove(pdf_path)
         except OSError:
@@ -196,17 +203,13 @@ def heartbeat(config):
 
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        # Пробуем разобрать JSON — сервер может вернуть статус внутри тела
-        try:
-            data = resp.json()
-            status = data.get("status", resp.status_code)
-        except Exception:
-            status = resp.status_code
-        print(f"[Heartbeat {now}] Status: {status}")
-        return status
+        data = resp.json()
+        print(f"[Heartbeat {now}] Status: {data.get('status')} ({data.get('message')})")
+
+        if data.get("status") in [401, 403]:
+            sync_token(config)
     except Exception as e:
         print(f"[Heartbeat {now}] Error: {e}")
-        return None
 
 
 def download_content(videos, media_dir):
@@ -238,12 +241,8 @@ def download_content(videos, media_dir):
 
         print(f"[* {now}] Загрузка {v_id} ({ext}) -> {target_filename}")
         try:
-            subprocess.run(
-                ['wget', '-O', target_path, v_url],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            subprocess.run(['wget', '-O', target_path, v_url], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
             print(f"[! {now}] Ошибка скачивания {v_id}: {e}")
             continue
@@ -264,7 +263,6 @@ class App:
         self.config = load_config()
         self.last_hb = 0
         self.last_check = 0
-        self.is_blocked = False  # флаг блокировки устройства
 
     def show_curtain(self):
         self.root.deiconify()
@@ -274,55 +272,17 @@ class App:
         self.root.withdraw()
         self.root.update()
 
-    def handle_blocked(self):
-        """Устройство заблокировано — останавливаем плеер и показываем чёрный экран."""
-        if not self.is_blocked:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"[! {now}] Устройство заблокировано. Остановка воспроизведения.")
-            self.is_blocked = True
-            stop_player()
-            self.root.after(0, self.show_curtain)
-
-    def handle_unblocked(self):
-        """Устройство разблокировано — запускаем плеер, затем скрываем чёрный экран."""
-        if self.is_blocked:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
-            self.is_blocked = False
-            # Сначала запускаем плеер, ждём пока откроется, потом убираем штору
-            start_player(
-                self.config['media_dir'],
-                image_duration=self.config.get('image_display_duration', 5)
-            )
-            time.sleep(2)
-            self.root.after(0, self.hide_curtain)
-
-    def shutdown(self, *_):
-        """Корректное завершение по Ctrl+C / SIGTERM."""
-        stop_player()
-        self.root.after(0, self.root.destroy)
-
     def worker_loop(self):
         """Фоновый поток для работы с API и скачивания."""
         while True:
             now_ts = time.time()
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            # Heartbeat
             if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
-                status = heartbeat(self.config)
+                heartbeat(self.config)
                 self.last_hb = now_ts
 
-                if status == 403:
-                    self.handle_blocked()
-                elif status == 401:
-                    sync_token(self.config)
-                elif status is not None and str(status).startswith('2'):
-                    # Сервер отвечает нормально (2xx) — снимаем блок если был
-                    self.handle_unblocked()
-
-            # Check Videos — пропускаем, если устройство заблокировано
-            if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
+            if now_ts - self.last_check > self.config.get('check_videos_interval', 60):
                 self.process_check_videos(now_str)
                 self.last_check = now_ts
 
@@ -340,9 +300,8 @@ class App:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             data = resp.json()
-            status = data.get("status")
 
-            if status == 205:
+            if data.get("status") == 205:
                 print(f"[{now_str}] Обновление контента...")
                 self.root.after(0, self.show_curtain)
                 stop_player()
@@ -354,7 +313,7 @@ class App:
                 time.sleep(3)
                 self.root.after(0, self.hide_curtain)
 
-            elif status == 204:
+            elif data.get("status") == 204:
                 global player_process
                 if player_process is None or player_process.poll() is not None:
                     start_player(
@@ -362,23 +321,13 @@ class App:
                         image_duration=self.config.get('image_display_duration', 5)
                     )
 
-            elif status == 401:
+            elif data.get("status") in [401, 403]:
                 sync_token(self.config)
-
-            # 403 не обрабатываем — worker_loop поймает его через heartbeat
 
         except Exception as e:
             print(f"[{now_str}] Ошибка check_videos: {e}")
 
     def run(self):
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
-
-        # Периодически отдаём управление Python, чтобы сигналы обрабатывались
-        def _poll():
-            self.root.after(200, _poll)
-        _poll()
-
         t = threading.Thread(target=self.worker_loop, daemon=True)
         t.start()
         self.root.mainloop()
