@@ -11,7 +11,7 @@ from datetime import datetime
 import signal
 from urllib.parse import urlparse
 
-CONFIG_FILE = 'config.json'
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 player_process = None
 
 # Паттерн имён файлов, полученных из PDF: {file_id}_p-001.png
