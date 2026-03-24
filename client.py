@@ -12,10 +12,11 @@ import signal
 from urllib.parse import urlparse
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-player_process = None
+PLAYLIST_STATE_FILENAME = "playlist_state.json"
 
 # Паттерн имён файлов, полученных из PDF: {file_id}_p-001.png
 PDF_PAGE_RE = re.compile(r'^(.+)_p-\d+\.png$')
+PDF_PAGE_INDEX_RE = re.compile(r'_p-(\d+)\.png$')
 
 
 class BlackCurtain:
@@ -48,47 +49,69 @@ class BlackCurtain:
 curtain = BlackCurtain()
 
 
-def stop_player():
-    global player_process
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    if player_process:
-        try:
-            os.killpg(os.getpgid(player_process.pid), signal.SIGTERM)
-            player_process = None
-            print(f"[Player {now}] Предыдущий процесс плеера остановлен.")
-        except Exception as e:
-            print(f"[Player {now}] Ошибка при остановке плеера: {e}")
+def get_playlist_state_path(media_dir):
+    return os.path.join(media_dir, PLAYLIST_STATE_FILENAME)
 
 
-def start_player(media_dir, image_duration=5):
-    global player_process
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    files = sorted([
-        os.path.join(media_dir, f)
-        for f in os.listdir(media_dir)
-        if os.path.isfile(os.path.join(media_dir, f))
-    ])
-
-    if not files:
-        print(f"[Player {now}] Нет файлов для воспроизведения.")
-        return
-
-    print(f"[Player {now}] Запуск воспроизведения {len(files)} файлов.")
-    cmd = [
-        "mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio",
-        f"--image-display-duration={image_duration}",
-    ] + files
-
+def normalize_duration(raw_duration, fallback_duration):
     try:
-        player_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid
-        )
-    except Exception as e:
-        print(f"[Player {now}] Ошибка запуска mpv: {e}")
+        value = int(raw_duration)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return int(fallback_duration)
+
+
+def extract_pdf_page_index(path):
+    name = os.path.basename(path)
+    match = PDF_PAGE_INDEX_RE.search(name)
+    if not match:
+        return -1
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return -1
+
+
+def save_playlist_state(media_dir, playlist):
+    os.makedirs(media_dir, exist_ok=True)
+    path = get_playlist_state_path(media_dir)
+    with open(path, 'w') as f:
+        json.dump(playlist, f, indent=4)
+
+
+def load_playlist_state(media_dir):
+    path = get_playlist_state_path(media_dir)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r') as f:
+            playlist = json.load(f)
+    except Exception:
+        return []
+
+    if not isinstance(playlist, list):
+        return []
+
+    valid_items = []
+    for item in playlist:
+        if not isinstance(item, dict):
+            continue
+        paths = item.get("paths", [])
+        if not isinstance(paths, list):
+            continue
+        existing_paths = [p for p in paths if isinstance(p, str) and os.path.exists(p)]
+        if not existing_paths:
+            continue
+        valid_items.append({
+            "id": str(item.get("id", "")),
+            "file_type": str(item.get("file_type", "video")),
+            "paths": existing_paths,
+            "duration_seconds": item.get("duration_seconds"),
+            "page_durations": item.get("page_durations", []),
+        })
+    return valid_items
 
 
 def load_config():
@@ -120,12 +143,13 @@ def get_local_file_ids(media_dir):
 def convert_pdf_to_images(pdf_path, file_id, media_dir):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     prefix = os.path.join(media_dir, f"{file_id}_p")
+    pages = []
     try:
         subprocess.run(
             ['pdftoppm', '-r', '150', '-png', pdf_path, prefix],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        pages = glob.glob(f"{prefix}-*.png")
+        pages = sorted(glob.glob(f"{prefix}-*.png"), key=extract_pdf_page_index)
         print(f"[* {now}] PDF {file_id} → {len(pages)} стр.")
     except FileNotFoundError:
         print(f"[! {now}] pdftoppm не найден. Установите: sudo apt install poppler-utils")
@@ -136,6 +160,7 @@ def convert_pdf_to_images(pdf_path, file_id, media_dir):
             os.remove(pdf_path)
         except OSError:
             pass
+    return pages
 
 
 def sync_token(config):
@@ -204,7 +229,7 @@ def heartbeat(config):
         return None
 
 
-def download_content(videos, media_dir):
+def download_content(videos, media_dir, fallback_duration):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[* {now}] Очистка локального контента...")
     if os.path.exists(media_dir):
@@ -218,10 +243,19 @@ def download_content(videos, media_dir):
     else:
         os.makedirs(media_dir)
 
+    playlist = []
     for v in videos:
         v_id = v['id']
         v_url = v['url']
-        ext = os.path.splitext(urlparse(v_url).path)[1].lower()
+        file_type = v.get('file_type', 'video')
+        playback = v.get('playback') or {}
+        duration_seconds = normalize_duration(
+            playback.get("duration_seconds"),
+            fallback_duration
+        )
+        ext = os.path.splitext(urlparse(v_url).path)[1].lower() or ".mp4"
+        if file_type == "pdf":
+            ext = ".pdf"
         target_filename = f"{v_id}{ext}"
         target_path = os.path.join(media_dir, target_filename)
         print(f"[* {now}] Загрузка {v_id} ({ext}) -> {target_filename}")
@@ -233,8 +267,159 @@ def download_content(videos, media_dir):
         except subprocess.CalledProcessError as e:
             print(f"[! {now}] Ошибка скачивания {v_id}: {e}")
             continue
-        if ext == '.pdf':
-            convert_pdf_to_images(target_path, v_id, media_dir)
+        if file_type == 'pdf':
+            page_paths = convert_pdf_to_images(target_path, v_id, media_dir)
+            page_durations_raw = playback.get("pdf_page_durations")
+            if not isinstance(page_durations_raw, list):
+                page_durations_raw = []
+            page_durations = [
+                normalize_duration(d, fallback_duration) for d in page_durations_raw
+            ]
+            playlist.append({
+                "id": v_id,
+                "file_type": file_type,
+                "paths": page_paths,
+                "duration_seconds": duration_seconds,
+                "page_durations": page_durations,
+            })
+        else:
+            playlist.append({
+                "id": v_id,
+                "file_type": file_type,
+                "paths": [target_path],
+                "duration_seconds": duration_seconds,
+                "page_durations": [],
+            })
+    save_playlist_state(media_dir, playlist)
+    return playlist
+
+
+class PlaybackManager:
+    def __init__(self, media_dir, default_duration):
+        self.media_dir = media_dir
+        self.default_duration = int(default_duration)
+        self.playlist = []
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.current_process = None
+
+    def is_running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def update_default_duration(self, duration):
+        self.default_duration = int(duration)
+
+    def set_playlist(self, playlist):
+        with self.lock:
+            self.playlist = playlist or []
+
+    def start(self):
+        if self.is_running():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self._terminate_current_process()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3)
+        self.thread = None
+
+    def _terminate_current_process(self):
+        with self.lock:
+            process = self.current_process
+        if not process:
+            return
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            print(f"[Player {now}] Процесс плеера остановлен.")
+        except Exception as e:
+            print(f"[Player {now}] Ошибка остановки плеера: {e}")
+        finally:
+            with self.lock:
+                self.current_process = None
+
+    def _play_single_path(self, path, duration_seconds):
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cmd = [
+            "mpv",
+            "--fs",
+            "--no-osc",
+            "--no-audio",
+            "--loop-file=inf",
+            f"--image-display-duration={duration_seconds}",
+            path,
+        ]
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid
+            )
+        except Exception as e:
+            print(f"[Player {now}] Ошибка запуска mpv для {path}: {e}")
+            return
+
+        with self.lock:
+            self.current_process = process
+
+        deadline = time.time() + duration_seconds
+        while not self.stop_event.is_set() and time.time() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.2)
+
+        if process.poll() is None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except Exception:
+                pass
+
+        with self.lock:
+            self.current_process = None
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            with self.lock:
+                playlist_snapshot = list(self.playlist)
+
+            if not playlist_snapshot:
+                time.sleep(0.5)
+                continue
+
+            for item in playlist_snapshot:
+                if self.stop_event.is_set():
+                    break
+
+                base_duration = normalize_duration(
+                    item.get("duration_seconds"),
+                    self.default_duration
+                )
+                file_type = item.get("file_type")
+                paths = item.get("paths", [])
+                if not paths:
+                    continue
+
+                if file_type == "pdf":
+                    page_durations = item.get("page_durations", [])
+                    for idx, page_path in enumerate(paths):
+                        if self.stop_event.is_set():
+                            break
+                        if idx < len(page_durations):
+                            page_duration = normalize_duration(
+                                page_durations[idx],
+                                self.default_duration
+                            )
+                        else:
+                            page_duration = base_duration
+                        self._play_single_path(page_path, page_duration)
+                else:
+                    self._play_single_path(paths[0], base_duration)
 
 
 class App:
@@ -249,6 +434,14 @@ class App:
         self.last_hb = 0
         self.last_check = 0
         self.is_blocked = False
+        self.default_duration = self.config.get('image_display_duration', 5)
+        self.playback_manager = PlaybackManager(
+            self.config['media_dir'],
+            self.default_duration
+        )
+        self.playback_manager.set_playlist(
+            load_playlist_state(self.config['media_dir'])
+        )
 
     def show_curtain(self):
         self.root.deiconify()
@@ -263,7 +456,7 @@ class App:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[! {now}] Устройство заблокировано. Остановка воспроизведения.")
             self.is_blocked = True
-            stop_player()
+            self.playback_manager.stop()
             self.root.after(0, self.show_curtain)
 
     def handle_unblocked(self):
@@ -271,15 +464,15 @@ class App:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
-            start_player(
-                self.config['media_dir'],
-                image_duration=self.config.get('image_display_duration', 5)
+            self.playback_manager.update_default_duration(
+                self.config.get('image_display_duration', 5)
             )
+            self.playback_manager.start()
             time.sleep(2)
             self.root.after(0, self.hide_curtain)
 
     def shutdown(self, *_):
-        stop_player()
+        self.playback_manager.stop()
         self.root.after(0, self.root.destroy)
 
     def worker_loop(self):
@@ -328,22 +521,26 @@ class App:
             if status == 205:
                 print(f"[{now_str}] Обновление контента...")
                 self.root.after(0, self.show_curtain)
-                stop_player()
-                download_content(data.get("videos", []), self.config['media_dir'])
-                start_player(
+                self.playback_manager.stop()
+                playlist = download_content(
+                    data.get("videos", []),
                     self.config['media_dir'],
-                    image_duration=self.config.get('image_display_duration', 5)
+                    self.config.get('image_display_duration', 5)
                 )
+                self.playback_manager.set_playlist(playlist)
+                self.playback_manager.start()
                 time.sleep(3)
                 self.root.after(0, self.hide_curtain)
 
             elif status == 204:
-                global player_process
-                if player_process is None or player_process.poll() is not None:
-                    start_player(
-                        self.config['media_dir'],
-                        image_duration=self.config.get('image_display_duration', 5)
+                self.playback_manager.update_default_duration(
+                    self.config.get('image_display_duration', 5)
+                )
+                if not self.playback_manager.is_running():
+                    self.playback_manager.set_playlist(
+                        load_playlist_state(self.config['media_dir'])
                     )
+                    self.playback_manager.start()
 
             elif status == 401:
                 sync_token(self.config)
