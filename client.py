@@ -130,6 +130,8 @@ def get_local_file_ids(media_dir):
         return []
     ids = set()
     for filename in os.listdir(media_dir):
+        if filename == PLAYLIST_STATE_FILENAME:
+            continue
         if not os.path.isfile(os.path.join(media_dir, filename)):
             continue
         m = PDF_PAGE_RE.match(filename)
@@ -295,7 +297,7 @@ def download_content(videos, media_dir, fallback_duration):
 
 
 class PlaybackManager:
-    def __init__(self, media_dir, default_duration):
+    def __init__(self, media_dir, default_duration, on_transition_start=None, on_transition_end=None):
         self.media_dir = media_dir
         self.default_duration = int(default_duration)
         self.playlist = []
@@ -303,6 +305,9 @@ class PlaybackManager:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.current_process = None
+        self.on_transition_start = on_transition_start
+        self.on_transition_end = on_transition_end
+        self.transition_curtain_visible = False
 
     def is_running(self):
         return self.thread is not None and self.thread.is_alive()
@@ -323,10 +328,26 @@ class PlaybackManager:
 
     def stop(self):
         self.stop_event.set()
+        self._show_transition_curtain()
         self._terminate_current_process()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=3)
         self.thread = None
+        self._hide_transition_curtain()
+
+    def _show_transition_curtain(self):
+        if self.transition_curtain_visible:
+            return
+        if self.on_transition_start:
+            self.on_transition_start()
+        self.transition_curtain_visible = True
+
+    def _hide_transition_curtain(self):
+        if not self.transition_curtain_visible:
+            return
+        if self.on_transition_end:
+            self.on_transition_end()
+        self.transition_curtain_visible = False
 
     def _terminate_current_process(self):
         with self.lock:
@@ -345,6 +366,7 @@ class PlaybackManager:
 
     def _play_single_path(self, path, duration_seconds):
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._show_transition_curtain()
         cmd = [
             "mpv",
             "--fs",
@@ -367,6 +389,9 @@ class PlaybackManager:
 
         with self.lock:
             self.current_process = process
+        # Даем mpv занять fullscreen и только потом скрываем шторку.
+        time.sleep(0.15)
+        self._hide_transition_curtain()
 
         deadline = time.time() + duration_seconds
         while not self.stop_event.is_set() and time.time() < deadline:
@@ -376,6 +401,7 @@ class PlaybackManager:
 
         if process.poll() is None:
             try:
+                self._show_transition_curtain()
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except Exception:
                 pass
@@ -437,7 +463,9 @@ class App:
         self.default_duration = self.config.get('image_display_duration', 5)
         self.playback_manager = PlaybackManager(
             self.config['media_dir'],
-            self.default_duration
+            self.default_duration,
+            on_transition_start=lambda: self.root.after(0, self.show_curtain),
+            on_transition_end=lambda: self.root.after(0, self.hide_curtain),
         )
         self.playback_manager.set_playlist(
             load_playlist_state(self.config['media_dir'])
