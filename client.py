@@ -133,8 +133,13 @@ def build_playlist_from_server(videos: list, media_dir: str) -> list:
 # Плеер
 # ============================================================
 
-def _player_loop(playlist: list):
-    """Фоновый поток: бесконечно крутит плейлист, запуская mpv для каждого файла."""
+def _player_loop(playlist: list, show_cb, hide_cb):
+    """Фоновый поток: бесконечно крутит плейлист.
+
+    show_cb / hide_cb — колбэки App для показа/скрытия чёрного экрана.
+    Чёрный экран поднимается перед каждым файлом и убирается
+    как только mpv успел открыться — переход без мигания рабочего стола.
+    """
     global player_process, player_running
 
     while player_running:
@@ -154,25 +159,33 @@ def _player_loop(playlist: list):
 
             cmd = ["mpv", "--fs", "--no-osc", "--no-audio"]
             if duration is not None:
-                # Для фото/страниц PDF — фиксированная длительность
                 cmd += [f"--image-display-duration={duration}", "--no-loop-file"]
             cmd.append(path)
 
             try:
+                # Показываем чёрный экран перед стартом следующего файла
+                show_cb()
+
                 player_process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     preexec_fn=os.setsid
                 )
-                player_process.wait()  # ждём завершения этого файла
+
+                # Даём mpv ~0.3 сек чтобы открыть окно, затем убираем шторку
+                time.sleep(0.3)
+                hide_cb()
+
+                player_process.wait()
                 player_process = None
+
             except Exception as e:
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 print(f"[Player {now}] Ошибка mpv: {e}")
 
 
-def start_player(media_dir: str):
+def start_player(media_dir: str, show_cb=None, hide_cb=None):
     """Запускает цикл воспроизведения плейлиста из media_dir."""
     global player_running, player_thread
 
@@ -185,8 +198,14 @@ def start_player(media_dir: str):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[Player {now}] Запуск воспроизведения, {len(playlist)} позиций в плейлисте.")
 
+    # Заглушки если колбэки не переданы
+    _show = show_cb or (lambda: None)
+    _hide = hide_cb or (lambda: None)
+
     player_running = True
-    player_thread = threading.Thread(target=_player_loop, args=(playlist,), daemon=True)
+    player_thread = threading.Thread(
+        target=_player_loop, args=(playlist, _show, _hide), daemon=True
+    )
     player_thread.start()
 
 
@@ -385,6 +404,10 @@ class App:
         self.last_check = 0
         self.is_blocked = False
 
+        # Колбэки для _player_loop — вызываются из фонового потока через after()
+        self._show_cb = lambda: self.root.after(0, self.show_curtain)
+        self._hide_cb = lambda: self.root.after(0, self.hide_curtain)
+
     def show_curtain(self):
         self.root.deiconify()
         self.root.update()
@@ -406,7 +429,7 @@ class App:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
-            start_player(self.config['media_dir'])
+            start_player(self.config['media_dir'], self._show_cb, self._hide_cb)
             time.sleep(2)
             self.root.after(0, self.hide_curtain)
 
@@ -457,14 +480,14 @@ class App:
                 self.root.after(0, self.show_curtain)
                 stop_player()
                 download_content(data.get("videos", []), self.config['media_dir'])
-                start_player(self.config['media_dir'])
+                start_player(self.config['media_dir'], self._show_cb, self._hide_cb)
                 time.sleep(3)
                 self.root.after(0, self.hide_curtain)
 
             elif status == 204:
                 global player_running
                 if not player_running:
-                    start_player(self.config['media_dir'])
+                    start_player(self.config['media_dir'], self._show_cb, self._hide_cb)
 
             elif status == 401:
                 sync_token(self.config)
