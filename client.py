@@ -96,6 +96,13 @@ def start_player():
     log("Все варианты vo провалены")
     return False
 
+def load_config():
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+    
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=4)
 
 def build_m3u_playlist(videos_data):
     MEDIA_DIR.mkdir(exist_ok=True)
