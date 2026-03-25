@@ -4,7 +4,6 @@ import time
 import subprocess
 import requests
 import signal
-import threading
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
@@ -14,11 +13,21 @@ MEDIA_DIR = Path("content").resolve()
 PLAYLIST_FILE = MEDIA_DIR / "playlist.m3u"
 
 player_process = None
-curtain_process = None
 
 def log(msg):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{now}] {msg}")
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        log("config.json не найден! Создайте его.")
+        exit(1)
+    with open(CONFIG_FILE, 'r') as f:
+        return json.load(f)
+
+def save_config(config):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
 
 def stop_player():
     global player_process
@@ -30,79 +39,46 @@ def stop_player():
         player_process = None
         log("Плеер остановлен")
 
-def start_curtain():
-    global curtain_process
-    if curtain_process and curtain_process.poll() is None:
-        return
-    try:
-        curtain_process = subprocess.Popen(["python3", "-c", """
-import tkinter as tk
-root = tk.Tk()
-root.attributes('-fullscreen', True)
-root.configure(background='black')
-root.config(cursor="none")
-root.mainloop()
-"""], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log("Чёрная шторка запущена")
-    except:
-        log("Не удалось запустить шторку (Tkinter)")
-
-def stop_curtain():
-    global curtain_process
-    if curtain_process:
-        try:
-            curtain_process.terminate()
-        except:
-            pass
-        curtain_process = None
-
 def start_player():
     global player_process
     if not PLAYLIST_FILE.exists():
         log("playlist.m3u не найден")
         return False
 
-    log("Запуск mpv (стабильный режим)")
+    log("Запуск mpv (--vo=xv)")
 
-    # Пробуем несколько вариантов vo в порядке стабильности
-    vo_options = [
-        ["--vo=xv", "--hwdec=auto"],           # самый стабильный на многих RK3588
-        ["--vo=gpu", "--gpu-context=x11", "--hwdec=auto"],
-        ["--vo=drm", "--gpu-context=drm", "--hwdec=auto"]
+    cmd = [
+        "mpv",
+        "--fs",
+        "--loop-playlist=inf",
+        "--no-osc",
+        "--no-audio",
+        "--no-border",
+        "--keep-open=always",
+        "--really-quiet",
+        "--vo=xv",           # самый стабильный вариант для Orange Pi
+        "--hwdec=auto-safe",
+        f"--playlist={PLAYLIST_FILE}"
     ]
 
-    for vo in vo_options:
-        cmd = [
-            "mpv", "--fs", "--loop-playlist=inf", "--no-osc", "--no-audio",
-            "--no-border", "--keep-open=always", "--really-quiet"
-        ] + vo + [f"--playlist={PLAYLIST_FILE}"]
+    try:
+        player_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid
+        )
+        time.sleep(1.5)
+        if player_process.poll() is None:
+            log("mpv запущен успешно (--vo=xv)")
+            return True
+        else:
+            log("mpv сразу упал после запуска")
+            return False
+    except Exception as e:
+        log(f"Ошибка запуска mpv: {e}")
+        return False
 
-        try:
-            player_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid
-            )
-            time.sleep(2)  # даём время на запуск
-            if player_process.poll() is None:
-                log(f"mpv запущен успешно с {vo[0]}")
-                return True
-            else:
-                log(f"mpv упал с {vo[0]}")
-        except Exception as e:
-            log(f"Ошибка с {vo[0]}: {e}")
-
-    log("Все варианты vo провалены")
-    return False
-
-def load_config():
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
-    
-def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=4)
 
 def build_m3u_playlist(videos_data):
     MEDIA_DIR.mkdir(exist_ok=True)
@@ -135,8 +111,11 @@ def build_m3u_playlist(videos_data):
 
 def heartbeat(config):
     try:
-        r = requests.post(f"{config['server_url']}/api/heartbeat",
-                          json={"token": config['token'], "id": config['device_id']}, timeout=8)
+        r = requests.post(
+            f"{config['server_url']}/api/heartbeat",
+            json={"token": config['token'], "id": config['device_id']},
+            timeout=8
+        )
         data = r.json()
         status = data.get("status")
         if status in (200, "actual") or data.get("success") is True:
@@ -150,33 +129,49 @@ def heartbeat(config):
 
 def check_videos(config):
     try:
-        current_ids = [f.stem.split('_p-')[0] if '_p-' in f.stem else f.stem 
-                       for f in MEDIA_DIR.iterdir() if f.is_file()]
+        # Собираем текущие file_id
+        current_ids = []
+        for f in MEDIA_DIR.iterdir():
+            if f.is_file():
+                name = f.stem
+                if "_p-" in name:
+                    current_ids.append(name.split("_p-")[0])
+                else:
+                    current_ids.append(name)
 
-        r = requests.post(f"{config['server_url']}/api/check-videos",
-                          json={"token": config['token'], "id": config['device_id'], "videos": current_ids},
-                          timeout=15)
+        r = requests.post(
+            f"{config['server_url']}/api/check-videos",
+            json={
+                "token": config['token'],
+                "id": config['device_id'],
+                "videos": list(set(current_ids))
+            },
+            timeout=15
+        )
         data = r.json()
 
         if data.get("status") == 205:
             log("Получен новый контент (205)")
             stop_player()
-            stop_curtain()
 
-            # очистка
+            # Очистка старых файлов
             for f in MEDIA_DIR.iterdir():
                 if f.is_file():
                     f.unlink()
 
-            # скачивание + обработка PDF
+            # Скачивание новых
             for v in data.get("videos", []):
                 fid = v["id"]
                 url = v["url"]
+                ftype = v.get("file_type", "video")
                 ext = os.path.splitext(urlparse(url).path)[1].lower() or ".mp4"
                 path = MEDIA_DIR / f"{fid}{ext}"
+
+                log(f"Скачиваю {fid}")
                 subprocess.run(["wget", "-q", "-O", str(path), url], check=True)
 
-                if v.get("file_type") == "pdf":
+                if ftype == "pdf":
+                    log(f"Конвертирую PDF {fid}")
                     subprocess.run(["pdftoppm", "-r", "150", "-png", str(path),
                                     str(MEDIA_DIR / f"{fid}_p")],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -196,27 +191,29 @@ def check_videos(config):
 
 def main():
     config = load_config()
-    log("Клиент запущен (стабильная версия)")
+    log("Клиент запущен — стабильная версия с vo=xv")
 
-    signal.signal(signal.SIGINT, lambda *a: (stop_player(), stop_curtain()))
-    signal.signal(signal.SIGTERM, lambda *a: (stop_player(), stop_curtain()))
+    signal.signal(signal.SIGINT, lambda *a: stop_player())
+    signal.signal(signal.SIGTERM, lambda *a: stop_player())
 
     last_hb = 0
     last_check = 0
 
+    # Первый запуск плеера
+    start_player()
+
     while True:
         now = time.time()
 
+        # Heartbeat
         if now - last_hb > config.get("heartbeat_interval", 30):
             status = heartbeat(config)
             last_hb = now
             if status == "blocked":
                 log("Устройство заблокировано")
                 stop_player()
-                start_curtain()
-            elif status == "ok":
-                stop_curtain()
 
+        # Check-videos
         if now - last_check > config.get("check_videos_interval", 60):
             check_videos(config)
             last_check = now
@@ -224,7 +221,8 @@ def main():
         # Авторестарт mpv если упал
         global player_process
         if player_process and player_process.poll() is not None:
-            log("mpv упал — перезапускаем")
+            log("mpv упал — перезапускаем через 2 секунды")
+            time.sleep(2)
             start_player()
 
         time.sleep(1)
