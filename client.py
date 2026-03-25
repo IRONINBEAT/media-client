@@ -1,82 +1,40 @@
 import os
-import re
 import json
 import time
-import glob
 import subprocess
 import requests
-import tkinter as tk
-import threading
 import signal
+import threading
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+CONFIG_FILE = "config.json"
+MEDIA_DIR = Path("content").resolve()
+PLAYLIST_FILE = MEDIA_DIR / "playlist.m3u"
 player_process = None
 
-# Паттерн для страниц PDF
-PDF_PAGE_RE = re.compile(r'^(.+)_p-\d+\.png$')
-
-class BlackCurtain:
-    def __init__(self):
-        self.root = None
-        self.thread = None
-
-    def _create_window(self):
-        try:
-            self.root = tk.Tk()
-            self.root.attributes('-fullscreen', True)
-            self.root.configure(background='black')
-            self.root.config(cursor="none")
-            self.root.bind("<Escape>", lambda e: self.stop())
-            print("[Curtain] Чёрная шторка запущена")
-            self.root.mainloop()
-        except Exception as e:
-            print(f"[Curtain] Не удалось запустить Tkinter: {e}")
-            print("[Curtain] Работает в консольном режиме (без шторки)")
-
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._create_window, daemon=True)
-        self.thread.start()
-        time.sleep(0.8)  # даём время на создание окна
-
-    def stop(self):
-        if self.root:
-            try:
-                self.root.after(0, self.root.destroy)
-            except:
-                pass
-            self.root = None
-
-
-curtain = BlackCurtain()
-
+def log(msg):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{now}] {msg}")
 
 def stop_player():
     global player_process
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if player_process:
         try:
             os.killpg(os.getpgid(player_process.pid), signal.SIGTERM)
-            player_process = None
-            print(f"[Player {now}] Плеер остановлен")
-        except Exception as e:
-            print(f"[Player {now}] Ошибка остановки: {e}")
+        except:
+            pass
+        player_process = None
+        log("Плеер остановлен")
 
-
-def start_player(media_dir):
+def start_player():
     global player_process
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    playlist = os.path.join(media_dir, "playlist.m3u")
+    if not PLAYLIST_FILE.exists():
+        log("playlist.m3u не найден")
+        return False
 
-    if not os.path.exists(playlist):
-        print(f"[Player {now}] playlist.m3u не найден")
-        return
-
-    print(f"[Player {now}] Запуск mpv с DRM")
+    log("Запуск mpv (--vo=drm)")
 
     cmd = [
         "mpv",
@@ -90,7 +48,7 @@ def start_player(media_dir):
         "--vo=drm",
         "--gpu-context=drm",
         "--hwdec=auto",
-        f"--playlist={playlist}"
+        f"--playlist={PLAYLIST_FILE}"
     ]
 
     try:
@@ -100,254 +58,165 @@ def start_player(media_dir):
             stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid
         )
-        print(f"[Player {now}] mpv запущен успешно")
+        log("mpv запущен успешно")
         return True
     except Exception as e:
-        print(f"[Player {now}] Ошибка запуска mpv: {e}")
+        log(f"Ошибка запуска mpv: {e}")
         return False
 
 
 def load_config():
-    with open(CONFIG_FILE, 'r') as f:
+    with open(CONFIG_FILE) as f:
         return json.load(f)
 
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=4)
 
 
-def get_local_file_ids(media_dir):
-    if not os.path.exists(media_dir):
+def get_local_ids():
+    if not MEDIA_DIR.exists():
         return []
     ids = set()
-    for filename in os.listdir(media_dir):
-        if not os.path.isfile(os.path.join(media_dir, filename)):
-            continue
-        m = PDF_PAGE_RE.match(filename)
-        if m:
-            ids.add(m.group(1))
-        else:
-            ids.add(os.path.splitext(filename)[0])
+    for f in MEDIA_DIR.iterdir():
+        if f.is_file():
+            name = f.stem
+            if "_p-" in name:                     # страница PDF
+                ids.add(name.split("_p-")[0])
+            else:
+                ids.add(name)
     return list(ids)
 
 
-def convert_pdf_to_images(pdf_path, file_id, media_dir):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    prefix = os.path.join(media_dir, f"{file_id}_p")
-    try:
-        subprocess.run(['pdftoppm', '-r', '150', '-png', pdf_path, prefix],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"[PDF {now}] {file_id} → страницы созданы")
-    except Exception as e:
-        print(f"[PDF {now}] Ошибка конвертации: {e}")
-    finally:
-        try:
-            os.remove(pdf_path)
-        except:
-            pass
-
-
-def build_m3u_playlist(media_dir, videos_data):
-    playlist_path = os.path.join(media_dir, "playlist.m3u")
-    with open(playlist_path, "w", encoding="utf-8") as f:
+def build_playlist(videos_data):
+    MEDIA_DIR.mkdir(exist_ok=True)
+    with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
         for v in videos_data:
-            file_id = v["id"]
-            playback = v.get("playback", {})
+            fid = v["id"]
             ftype = v.get("file_type", "video")
-
+            playback = v.get("playback", {})
+            
             if ftype == "pdf":
                 pages = playback.get("pdf_page_durations", [])
                 if not pages:
                     pages = [{"page": 1, "duration": 5}]
                 for p in pages:
-                    page_path = os.path.join(media_dir, f"{file_id}_p-{p['page']:03d}.png")
-                    if os.path.exists(page_path):
-                        f.write(f"#EXTINF:{p['duration']},{file_id}_page{p['page']}\n")
-                        f.write(f"{page_path}\n")
+                    page_file = MEDIA_DIR / f"{fid}_p-{p['page']:03d}.png"
+                    if page_file.exists():
+                        f.write(f"#EXTINF:{p['duration']},page{p['page']}\n")
+                        f.write(f"{page_file}\n")
             else:
-                file_path = None
+                # video / image
                 for ext in [".mp4", ".png", ".jpg", ".jpeg"]:
-                    candidate = os.path.join(media_dir, f"{file_id}{ext}")
-                    if os.path.exists(candidate):
-                        file_path = candidate
+                    candidate = MEDIA_DIR / f"{fid}{ext}"
+                    if candidate.exists():
+                        duration = playback.get("duration_seconds")
+                        dur = duration if duration and duration > 0 else -1
+                        f.write(f"#EXTINF:{dur},{fid}\n")
+                        f.write(f"{candidate}\n")
                         break
-                if file_path:
-                    duration = playback.get("duration_seconds")
-                    dur = duration if duration and duration > 0 else -1
-                    f.write(f"#EXTINF:{dur},{file_id}\n")
-                    f.write(f"{file_path}\n")
-    return playlist_path
-
-
-def sync_token(config):
-    url = f"{config['server_url']}/api/sync-token"
-    payload = {"token": config['token'], "id": config['device_id']}
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        data = r.json()
-        if data.get("success") and data.get("status") == "updated":
-            config['token'] = data['new_token']
-            save_config(config)
-            print(f"[* {now}] Токен обновлён")
-            return True
-    except Exception as e:
-        print(f"[! {now}] sync_token ошибка: {e}")
-    return False
 
 
 def heartbeat(config):
-    url = f"{config['server_url']}/api/heartbeat"
-    payload = {"token": config['token'], "id": config['device_id']}
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
+        r = requests.post(
+            f"{config['server_url']}/api/heartbeat",
+            json={"token": config['token'], "id": config['device_id']},
+            timeout=10
+        )
+        data = r.json()
         status = data.get("status")
-
-        if status in (200, "actual", "ok") or data.get("success") is True:
+        if status in (200, "actual") or data.get("success") is True:
             return "ok"
-        if status in (403, "403", "blocked"):
+        if status in (403, "403"):
             return "blocked"
         return "invalid"
-    except Exception:
+    except:
         return None
 
 
-def download_content(videos, media_dir):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[* {now}] Очистка и загрузка нового контента...")
-
-    for f in os.listdir(media_dir):
-        try:
-            os.unlink(os.path.join(media_dir, f))
-        except:
-            pass
-
-    for v in videos:
-        v_id = v['id']
-        v_url = v['url']
-        ftype = v.get('file_type', 'video')
-
-        ext = os.path.splitext(urlparse(v_url).path)[1].lower() or ".mp4"
-        target_path = os.path.join(media_dir, f"{v_id}{ext}")
-
-        print(f"[* {now}] Загрузка {v_id}")
-        try:
-            subprocess.run(['wget', '-O', target_path, v_url], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print(f"[!] Ошибка загрузки {v_id}: {e}")
-            continue
-
-        if ftype == "pdf":
-            convert_pdf_to_images(target_path, v_id, media_dir)
-
-
-class App:
-    def __init__(self):
-        self.config = load_config()
-        self.last_hb = 0
-        self.last_check = 0
-        self.is_blocked = False
-
-    def show_curtain(self):
-        curtain.start()
-
-    def hide_curtain(self):
-        curtain.stop()
-
-    def handle_blocked(self):
-        if not self.is_blocked:
-            print(f"[!] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Устройство заблокировано")
-            self.is_blocked = True
+def check_videos(config):
+    try:
+        current_ids = get_local_ids()
+        r = requests.post(
+            f"{config['server_url']}/api/check-videos",
+            json={
+                "token": config['token'],
+                "id": config['device_id'],
+                "videos": current_ids
+            },
+            timeout=15
+        )
+        data = r.json()
+        if data.get("status") == 205:
+            log("Получен новый контент (205)")
             stop_player()
-            self.show_curtain()
+            # очистка
+            for f in MEDIA_DIR.iterdir():
+                if f.is_file():
+                    f.unlink()
+            # скачивание
+            for v in data.get("videos", []):
+                fid = v["id"]
+                url = v["url"]
+                ext = os.path.splitext(urlparse(url).path)[1].lower() or ".mp4"
+                path = MEDIA_DIR / f"{fid}{ext}"
+                subprocess.run(["wget", "-q", "-O", str(path), url], check=True)
+                if v.get("file_type") == "pdf":
+                    subprocess.run(["pdftoppm", "-r", "150", "-png", str(path), str(MEDIA_DIR / f"{fid}_p")],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    try:
+                        path.unlink()
+                    except:
+                        pass
+            build_playlist(data.get("videos", []))
+            start_player()
+            return True
+        return False
+    except Exception as e:
+        log(f"check_videos ошибка: {e}")
+        return False
 
-    def handle_unblocked(self):
-        if self.is_blocked:
-            print(f"[*] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Устройство разблокировано")
-            self.is_blocked = False
-            self.hide_curtain()
-            start_player(self.config['media_dir'])
 
-    def shutdown(self, *_):
-        stop_player()
-        curtain.stop()
-        print("Клиент завершён")
+def main():
+    config = load_config()
+    log("Клиент запущен (минимальная версия)")
 
-    def worker_loop(self):
-        while True:
-            now_ts = time.time()
-            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    signal.signal(signal.SIGINT, lambda *a: stop_player())
+    signal.signal(signal.SIGTERM, lambda *a: stop_player())
 
-            # Heartbeat
-            if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
-                status = heartbeat(self.config)
-                self.last_hb = now_ts
+    last_hb = 0
+    last_check = 0
 
-                if status == "blocked":
-                    self.handle_blocked()
-                elif status == "invalid":
-                    self.handle_blocked()
-                    sync_token(self.config)
-                elif status == "ok":
-                    self.handle_unblocked()
+    while True:
+        now = time.time()
 
-            # Check-videos
-            if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
-                self.process_check_videos(now_str)
-                self.last_check = now_ts
-
-            time.sleep(1)
-
-    def process_check_videos(self, now_str):
-        url = f"{self.config['server_url']}/api/check-videos"
-        current_ids = get_local_file_ids(self.config['media_dir'])
-
-        payload = {
-            "token": self.config['token'],
-            "id": self.config['device_id'],
-            "videos": current_ids
-        }
-
-        try:
-            resp = requests.post(url, json=payload, timeout=15)
-            data = resp.json()
-            status = data.get("status")
-
-            if status == 205:
-                print(f"[{now_str}] Новый контент (205)")
-                self.show_curtain()
+        # Heartbeat
+        if now - last_hb > config.get("heartbeat_interval", 30):
+            status = heartbeat(config)
+            last_hb = now
+            if status == "blocked":
+                log("Устройство заблокировано")
                 stop_player()
-                download_content(data.get("videos", []), self.config['media_dir'])
-                build_m3u_playlist(self.config['media_dir'], data.get("videos", []))
-                start_player(self.config['media_dir'])
-                time.sleep(2)
-                self.hide_curtain()
+            elif status == "ok":
+                log("Устройство активно")
 
-            elif status == 204:
-                global player_process
-                if player_process is None or player_process.poll() is not None:
-                    start_player(self.config['media_dir'])
+        # Check-videos
+        if now - last_check > config.get("check_videos_interval", 60):
+            check_videos(config)
+            last_check = now
 
-        except Exception as e:
-            print(f"[{now_str}] check_videos ошибка: {e}")
+        # Авторестарт mpv, если он упал
+        global player_process
+        if player_process and player_process.poll() is not None:
+            log("mpv упал — перезапускаем")
+            start_player()
 
-    def run(self):
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
-
-        print("🚀 Клиент запущен (со шторкой)")
-
-        # Запускаем главный цикл
-        t = threading.Thread(target=self.worker_loop, daemon=True)
-        t.start()
-        t.join()
+        time.sleep(1)
 
 
 if __name__ == "__main__":
-    app = App()
-    app.run()
+    MEDIA_DIR.mkdir(exist_ok=True)
+    main()
