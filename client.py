@@ -1,65 +1,84 @@
 import os
+import re
 import json
 import time
+import glob
 import subprocess
 import requests
-import signal
+import tkinter as tk
+import threading
 from datetime import datetime
+import signal
 from urllib.parse import urlparse
-from pathlib import Path
 
-CONFIG_FILE = "config.json"
-MEDIA_DIR = Path("content").resolve()
-PLAYLIST_FILE = MEDIA_DIR / "playlist.m3u"
-
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 player_process = None
 
-def log(msg):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{now}] {msg}")
+# Паттерн имён файлов, полученных из PDF: {file_id}_p-001.png
+PDF_PAGE_RE = re.compile(r'^(.+)_p-\d+\.png$')
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        log("config.json не найден! Создайте его.")
-        exit(1)
-    with open(CONFIG_FILE, 'r') as f:
-        return json.load(f)
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+class BlackCurtain:
+    def __init__(self):
+        self.root = None
+        self.thread = None
+
+    def _create_window(self):
+        self.root = tk.Tk()
+        self.root.attributes('-fullscreen', True)
+        self.root.configure(background='black')
+        self.root.config(cursor="none")
+        self.root.bind("<Escape>", lambda e: self.stop())
+        self.root.mainloop()
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._create_window, daemon=True)
+        self.thread.start()
+        time.sleep(1)
+
+    def stop(self):
+        if self.root:
+            self.root.after(0, self.root.destroy)
+            self.thread.join()
+            self.root = None
+
+
+curtain = BlackCurtain()
+
 
 def stop_player():
     global player_process
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if player_process:
         try:
             os.killpg(os.getpgid(player_process.pid), signal.SIGTERM)
-        except:
-            pass
-        player_process = None
-        log("Плеер остановлен")
+            player_process = None
+            print(f"[Player {now}] Предыдущий процесс плеера остановлен.")
+        except Exception as e:
+            print(f"[Player {now}] Ошибка при остановке плеера: {e}")
 
-def start_player():
+
+def start_player(media_dir, image_duration=5):
     global player_process
-    if not PLAYLIST_FILE.exists():
-        log("playlist.m3u не найден")
-        return False
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    log("Запуск mpv (--vo=xv)")
+    files = sorted([
+        os.path.join(media_dir, f)
+        for f in os.listdir(media_dir)
+        if os.path.isfile(os.path.join(media_dir, f))
+    ])
 
+    if not files:
+        print(f"[Player {now}] Нет файлов для воспроизведения.")
+        return
+
+    print(f"[Player {now}] Запуск воспроизведения {len(files)} файлов.")
     cmd = [
-        "mpv",
-        "--fs",
-        "--loop-playlist=inf",
-        "--no-osc",
-        "--no-audio",
-        "--no-border",
-        "--keep-open=always",
-        "--really-quiet",
-        "--vo=xv",           # самый стабильный вариант для Orange Pi
-        "--hwdec=auto-safe",
-        f"--playlist={PLAYLIST_FILE}"
-    ]
+        "mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio",
+        f"--image-display-duration={image_duration}",
+    ] + files
 
     try:
         player_process = subprocess.Popen(
@@ -68,166 +87,286 @@ def start_player():
             stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid
         )
-        time.sleep(1.5)
-        if player_process.poll() is None:
-            log("mpv запущен успешно (--vo=xv)")
-            return True
-        else:
-            log("mpv сразу упал после запуска")
-            return False
     except Exception as e:
-        log(f"Ошибка запуска mpv: {e}")
+        print(f"[Player {now}] Ошибка запуска mpv: {e}")
+
+
+def load_config():
+    with open(CONFIG_FILE, 'r') as f:
+        return json.load(f)
+
+
+def save_config(config):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
+
+
+def get_local_file_ids(media_dir):
+    if not os.path.exists(media_dir):
+        os.makedirs(media_dir)
+        return []
+    ids = set()
+    for filename in os.listdir(media_dir):
+        if not os.path.isfile(os.path.join(media_dir, filename)):
+            continue
+        m = PDF_PAGE_RE.match(filename)
+        if m:
+            ids.add(m.group(1))
+        else:
+            ids.add(os.path.splitext(filename)[0])
+    return list(ids)
+
+
+def convert_pdf_to_images(pdf_path, file_id, media_dir):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    prefix = os.path.join(media_dir, f"{file_id}_p")
+    try:
+        subprocess.run(
+            ['pdftoppm', '-r', '150', '-png', pdf_path, prefix],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        pages = glob.glob(f"{prefix}-*.png")
+        print(f"[* {now}] PDF {file_id} → {len(pages)} стр.")
+    except FileNotFoundError:
+        print(f"[! {now}] pdftoppm не найден. Установите: sudo apt install poppler-utils")
+    except subprocess.CalledProcessError as e:
+        print(f"[! {now}] Ошибка конвертации PDF {file_id}: {e}")
+    finally:
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            pass
+
+
+def sync_token(config):
+    url = f"{config['server_url']}/api/sync-token"
+    payload = {"token": config['token'], "id": config['device_id']}
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        data = response.json()
+        if data.get("success") and data.get("status") == "updated":
+            config['token'] = data['new_token']
+            save_config(config)
+            print(f"[* {now}] Токен успешно обновлен: {config['token']}")
+            return True
         return False
-
-
-def build_m3u_playlist(videos_data):
-    MEDIA_DIR.mkdir(exist_ok=True)
-    with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
-        f.write("#EXTM3U\n")
-        for v in videos_data:
-            fid = v["id"]
-            ftype = v.get("file_type", "video")
-            playback = v.get("playback", {})
-
-            if ftype == "pdf":
-                pages = playback.get("pdf_page_durations", [])
-                if not pages:
-                    pages = [{"page": 1, "duration": 5}]
-                for p in pages:
-                    page_file = MEDIA_DIR / f"{fid}_p-{p['page']:03d}.png"
-                    if page_file.exists():
-                        f.write(f"#EXTINF:{p['duration']},page{p['page']}\n")
-                        f.write(f"{page_file}\n")
-            else:
-                for ext in [".mp4", ".png", ".jpg", ".jpeg"]:
-                    candidate = MEDIA_DIR / f"{fid}{ext}"
-                    if candidate.exists():
-                        duration = playback.get("duration_seconds")
-                        dur = duration if duration and duration > 0 else -1
-                        f.write(f"#EXTINF:{dur},{fid}\n")
-                        f.write(f"{candidate}\n")
-                        break
+    except Exception as e:
+        print(f"[! {now}] Ошибка синхронизации: {e}")
+        return False
 
 
 def heartbeat(config):
+    """Отправляет пинг серверу и возвращает нормализованный статус:
+      "ok"      — устройство активно, токен валиден
+      "blocked" — устройство заблокировано
+      "invalid" — токен недействителен, нужен sync-token
+      None      — сервер недоступен
+    """
+    url = f"{config['server_url']}/api/heartbeat"
+    payload = {"token": config['token'], "id": config['device_id']}
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     try:
-        r = requests.post(
-            f"{config['server_url']}/api/heartbeat",
-            json={"token": config['token'], "id": config['device_id']},
-            timeout=8
-        )
-        data = r.json()
+        resp = requests.post(url, json=payload, timeout=10)
+        data = resp.json()
         status = data.get("status")
-        if status in (200, "actual") or data.get("success") is True:
+        success = data.get("success")
+        message = data.get("message", "")
+        print(f"[Heartbeat {now}] success={success} status={status} msg={message}")
+
+        # Токен обновлён — сохраняем новый
+        if status == "updated":
+            new_token = data.get("new_token")
+            if new_token:
+                config['token'] = new_token
+                save_config(config)
+                print(f"[* {now}] Токен обновлён через heartbeat: {new_token}")
             return "ok"
-        if status in (403, "403"):
+
+        # Устройство заблокировано
+        if status == 403 or status == "403" or str(status) == "403":
             return "blocked"
+
+        # Токен недействителен (unauthorized)
+        if status == 401 or status == "401" or str(status) == "401":
+            return "unauthorized"
+
+        # Любой признак успеха: "actual", 200, success=True
+        if status == "actual" or status == 200 or success is True:
+            return "ok"
+
+        # Всё остальное — токен недействителен
         return "invalid"
-    except:
+
+    except Exception as e:
+        print(f"[Heartbeat {now}] Error: {e}")
         return None
 
 
-def check_videos(config):
-    try:
-        # Собираем текущие file_id
-        current_ids = []
-        for f in MEDIA_DIR.iterdir():
-            if f.is_file():
-                name = f.stem
-                if "_p-" in name:
-                    current_ids.append(name.split("_p-")[0])
-                else:
-                    current_ids.append(name)
+def download_content(videos, media_dir):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[* {now}] Очистка локального контента...")
+    if os.path.exists(media_dir):
+        for file in os.listdir(media_dir):
+            file_path = os.path.join(media_dir, file)
+            try:
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+            except Exception as e:
+                print(f"[! {now}] Ошибка удаления {file_path}: {e}")
+    else:
+        os.makedirs(media_dir)
 
-        r = requests.post(
-            f"{config['server_url']}/api/check-videos",
-            json={
-                "token": config['token'],
-                "id": config['device_id'],
-                "videos": list(set(current_ids))
-            },
-            timeout=15
-        )
-        data = r.json()
+    for v in videos:
+        v_id = v['id']
+        v_url = v['url']
+        ext = os.path.splitext(urlparse(v_url).path)[1].lower()
+        target_filename = f"{v_id}{ext}"
+        target_path = os.path.join(media_dir, target_filename)
+        print(f"[* {now}] Загрузка {v_id} ({ext}) -> {target_filename}")
+        try:
+            subprocess.run(
+                ['wget', '-O', target_path, v_url],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"[! {now}] Ошибка скачивания {v_id}: {e}")
+            continue
+        if ext == '.pdf':
+            convert_pdf_to_images(target_path, v_id, media_dir)
 
-        if data.get("status") == 205:
-            log("Получен новый контент (205)")
+
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.attributes('-fullscreen', True)
+        self.root.configure(background='black')
+        self.root.config(cursor="none")
+        self.root.withdraw()
+
+        self.config = load_config()
+        self.last_hb = 0
+        self.last_check = 0
+        self.is_blocked = False
+
+    def show_curtain(self):
+        self.root.deiconify()
+        self.root.update()
+
+    def hide_curtain(self):
+        self.root.withdraw()
+        self.root.update()
+
+    def handle_blocked(self):
+        if not self.is_blocked:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[! {now}] Устройство заблокировано. Остановка воспроизведения.")
+            self.is_blocked = True
             stop_player()
+            self.root.after(0, self.show_curtain)
 
-            # Очистка старых файлов
-            for f in MEDIA_DIR.iterdir():
-                if f.is_file():
-                    f.unlink()
-
-            # Скачивание новых
-            for v in data.get("videos", []):
-                fid = v["id"]
-                url = v["url"]
-                ftype = v.get("file_type", "video")
-                ext = os.path.splitext(urlparse(url).path)[1].lower() or ".mp4"
-                path = MEDIA_DIR / f"{fid}{ext}"
-
-                log(f"Скачиваю {fid}")
-                subprocess.run(["wget", "-q", "-O", str(path), url], check=True)
-
-                if ftype == "pdf":
-                    log(f"Конвертирую PDF {fid}")
-                    subprocess.run(["pdftoppm", "-r", "150", "-png", str(path),
-                                    str(MEDIA_DIR / f"{fid}_p")],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    try:
-                        path.unlink()
-                    except:
-                        pass
-
-            build_m3u_playlist(data.get("videos", []))
-            start_player()
-            return True
-        return False
-    except Exception as e:
-        log(f"check_videos ошибка: {e}")
-        return False
-
-
-def main():
-    config = load_config()
-    log("Клиент запущен — стабильная версия с vo=xv")
-
-    signal.signal(signal.SIGINT, lambda *a: stop_player())
-    signal.signal(signal.SIGTERM, lambda *a: stop_player())
-
-    last_hb = 0
-    last_check = 0
-
-    # Первый запуск плеера
-    start_player()
-
-    while True:
-        now = time.time()
-
-        # Heartbeat
-        if now - last_hb > config.get("heartbeat_interval", 30):
-            status = heartbeat(config)
-            last_hb = now
-            if status == "blocked":
-                log("Устройство заблокировано")
-                stop_player()
-
-        # Check-videos
-        if now - last_check > config.get("check_videos_interval", 60):
-            check_videos(config)
-            last_check = now
-
-        # Авторестарт mpv если упал
-        global player_process
-        if player_process and player_process.poll() is not None:
-            log("mpv упал — перезапускаем через 2 секунды")
+    def handle_unblocked(self):
+        if self.is_blocked:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
+            self.is_blocked = False
+            start_player(
+                self.config['media_dir'],
+                image_duration=self.config.get('image_display_duration', 5)
+            )
             time.sleep(2)
-            start_player()
+            self.root.after(0, self.hide_curtain)
 
-        time.sleep(1)
+    def shutdown(self, *_):
+        stop_player()
+        self.root.after(0, self.root.destroy)
+
+    def worker_loop(self):
+        while True:
+            now_ts = time.time()
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
+                status = heartbeat(self.config)
+                self.last_hb = now_ts
+
+                if status == "blocked":
+                    self.handle_blocked()
+                elif status == "unauthorized":
+                    # Останавливаем воспроизведение и пробуем обновить токен
+                    self.handle_blocked()
+                    sync_token(self.config)
+                elif status == "ok":
+                    self.handle_unblocked()
+                elif status == "invalid":
+                    self.handle_blocked()
+                    sync_token(self.config)
+                # None — сервер недоступен, ждём следующего heartbeat
+
+            # check-videos пропускаем пока устройство заблокировано
+            if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
+                self.process_check_videos(now_str)
+                self.last_check = now_ts
+
+            time.sleep(1)
+
+    def process_check_videos(self, now_str):
+        url = f"{self.config['server_url']}/api/check-videos"
+        current_ids = get_local_file_ids(self.config['media_dir'])
+        payload = {
+            "token": self.config['token'],
+            "id": self.config['device_id'],
+            "videos": current_ids
+        }
+
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            data = resp.json()
+            status = data.get("status")
+
+            if status == 205:
+                print(f"[{now_str}] Обновление контента...")
+                self.root.after(0, self.show_curtain)
+                stop_player()
+                download_content(data.get("videos", []), self.config['media_dir'])
+                start_player(
+                    self.config['media_dir'],
+                    image_duration=self.config.get('image_display_duration', 5)
+                )
+                time.sleep(3)
+                self.root.after(0, self.hide_curtain)
+
+            elif status == 204:
+                global player_process
+                if player_process is None or player_process.poll() is not None:
+                    start_player(
+                        self.config['media_dir'],
+                        image_duration=self.config.get('image_display_duration', 5)
+                    )
+
+            elif status == 401:
+                sync_token(self.config)
+
+            elif status == 403:
+                self.handle_blocked()
+
+        except Exception as e:
+            print(f"[{now_str}] Ошибка check_videos: {e}")
+
+    def run(self):
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
+
+        def _poll():
+            self.root.after(200, _poll)
+        _poll()
+
+        t = threading.Thread(target=self.worker_loop, daemon=True)
+        t.start()
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
-    MEDIA_DIR.mkdir(exist_ok=True)
-    main()
+    app = App()
+    app.run()
