@@ -90,7 +90,7 @@ def start_player(media_dir, image_display_duration=5):
             print(f"[Player {now}] Ошибка загрузки длительностей: {e}")
 
     # Формируем команду mpv
-    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio"]
+    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio", "--vo=gpu"]
     for filepath in all_files:
         base = os.path.basename(filepath)
         dur = durations.get(base)
@@ -112,6 +112,9 @@ def start_player(media_dir, image_display_duration=5):
             # Для видео без ограничения – не добавляем опций
         cmd.append(filepath)
 
+    print(f"[Player {now}] Команда: {' '.join(cmd)}")
+    print(f"[Player {now}] DISPLAY: {os.environ.get('DISPLAY')}")
+    
     print(f"[Player {now}] Запуск воспроизведения {len(all_files)} файлов.")
     try:
         player_process = subprocess.Popen(
@@ -120,6 +123,7 @@ def start_player(media_dir, image_display_duration=5):
             stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid
         )
+        print(f"[Player {now}] Запущен процесс {player_process.pid}")
     except Exception as e:
         print(f"[Player {now}] Ошибка запуска mpv: {e}")
 
