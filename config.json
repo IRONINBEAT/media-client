@@ -4,6 +4,6 @@
     "token": "_K6XVbKYohH7yMc6_lqiOzSS_qsBAZRj6HVSehBGKVKs5XYpyM4SJyJvDLmOaIjh",
     "media_dir": "./content",
     "heartbeat_interval": 30,
-    "check_videos_interval": 60,
+    "check_videos_interval": 180,
     "image_display_duration": 5
 }
