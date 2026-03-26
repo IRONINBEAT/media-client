@@ -5,7 +5,6 @@ import time
 import glob
 import subprocess
 import requests
-import tkinter as tk
 import threading
 from datetime import datetime
 import signal
@@ -16,36 +15,6 @@ DURATIONS_FILE = ".durations.json"
 PDF_PAGE_RE = re.compile(r'^(.+)_p-(\d+)\.png$')
 
 player_process = None
-
-
-class BlackCurtain:
-    def __init__(self):
-        self.root = None
-        self.thread = None
-
-    def _create_window(self):
-        self.root = tk.Tk()
-        self.root.attributes('-fullscreen', True)
-        self.root.configure(background='black')
-        self.root.config(cursor="none")
-        self.root.bind("<Escape>", lambda e: self.stop())
-        self.root.mainloop()
-
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._create_window, daemon=True)
-        self.thread.start()
-        time.sleep(1)
-
-    def stop(self):
-        if self.root:
-            self.root.after(0, self.root.destroy)
-            self.thread.join()
-            self.root = None
-
-
-curtain = BlackCurtain()
 
 
 def stop_player():
@@ -63,6 +32,11 @@ def stop_player():
 def start_player(media_dir, image_display_duration=5):
     global player_process
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Проверяем существование папки
+    if not os.path.exists(media_dir):
+        print(f"[Player {now}] Папка {media_dir} не существует")
+        return
 
     # Список всех файлов в папке, исключая служебные
     all_files = []
@@ -90,7 +64,12 @@ def start_player(media_dir, image_display_duration=5):
             print(f"[Player {now}] Ошибка загрузки длительностей: {e}")
 
     # Формируем команду mpv
-    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio", "--vo=gpu"]
+    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio"]
+    
+    # Добавляем видео-вывод, если указан в конфиге
+    video_output = os.environ.get('MPV_VO', 'x11')
+    cmd.extend(['--vo', video_output])
+    
     for filepath in all_files:
         base = os.path.basename(filepath)
         dur = durations.get(base)
@@ -106,24 +85,33 @@ def start_player(media_dir, image_display_duration=5):
         else:
             # Нет данных о длительности – используем старую логику
             if ext in ('.png', '.jpg', '.jpeg'):
-                # Для изображений применяем глобальную настройку из конфига
-                # Чтобы она действовала только на этот файл, нужно указать перед ним
+                # Для изображений применяем глобальную настройку
                 cmd.extend(['--image-display-duration', str(image_display_duration)])
-            # Для видео без ограничения – не добавляем опций
         cmd.append(filepath)
 
-    print(f"[Player {now}] Команда: {' '.join(cmd)}")
-    print(f"[Player {now}] DISPLAY: {os.environ.get('DISPLAY')}")
-    
+    print(f"[Player {now}] Команда: {' '.join(cmd[:20])}...")  # Выводим начало команды
     print(f"[Player {now}] Запуск воспроизведения {len(all_files)} файлов.")
+    
     try:
+        # Создаем окружение с DISPLAY
+        env = os.environ.copy()
+        if 'DISPLAY' not in env:
+            env['DISPLAY'] = ':0.0'
+            
         player_process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid
+            stdout=None,  # Временно выводим для отладки
+            stderr=None,  # Временно выводим для отладки
+            preexec_fn=os.setsid,
+            env=env
         )
         print(f"[Player {now}] Запущен процесс {player_process.pid}")
+        
+        # Небольшая задержка для проверки, не упал ли процесс сразу
+        time.sleep(2)
+        if player_process.poll() is not None:
+            print(f"[Player {now}] Плеер завершился с кодом {player_process.returncode}")
+            
     except Exception as e:
         print(f"[Player {now}] Ошибка запуска mpv: {e}")
 
@@ -157,7 +145,6 @@ def get_local_file_ids(media_dir):
 def convert_pdf_to_images(pdf_path, file_id, media_dir, page_durations=None):
     """
     Конвертирует PDF в PNG и возвращает список (путь к PNG, длительность) для каждой страницы.
-    page_durations: список длительностей страниц, если задан.
     """
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     prefix = os.path.join(media_dir, f"{file_id}_p")
@@ -205,12 +192,7 @@ def sync_token(config):
 
 
 def heartbeat(config):
-    """Отправляет пинг серверу и возвращает нормализованный статус:
-      "ok"      — устройство активно, токен валиден
-      "blocked" — устройство заблокировано
-      "invalid" — токен недействителен, нужен sync-token
-      None      — сервер недоступен
-    """
+    """Отправляет пинг серверу и возвращает нормализованный статус"""
     url = f"{config['server_url']}/api/heartbeat"
     payload = {"token": config['token'], "id": config['device_id']}
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -220,10 +202,8 @@ def heartbeat(config):
         data = resp.json()
         status = data.get("status")
         success = data.get("success")
-        message = data.get("message", "")
-        print(f"[Heartbeat {now}] success={success} status={status} msg={message}")
+        print(f"[Heartbeat {now}] status={status} success={success}")
 
-        # Токен обновлён — сохраняем новый
         if status == "updated":
             new_token = data.get("new_token")
             if new_token:
@@ -231,34 +211,24 @@ def heartbeat(config):
                 save_config(config)
                 print(f"[* {now}] Токен обновлён через heartbeat: {new_token}")
             return "ok"
-
-        # Устройство заблокировано
-        if status == 403 or status == "403" or str(status) == "403":
+        elif status == 403 or str(status) == "403":
             return "blocked"
-
-        # Токен недействителен (unauthorized)
-        if status == 401 or status == "401" or str(status) == "401":
+        elif status == 401 or str(status) == "401":
             return "unauthorized"
-
-        # Любой признак успеха: "actual", 200, success=True
-        if status == "actual" or status == 200 or success is True:
+        elif status == "actual" or status == 200 or success is True:
             return "ok"
-
-        # Всё остальное — токен недействителен
-        return "invalid"
-
+        else:
+            return "invalid"
     except Exception as e:
         print(f"[Heartbeat {now}] Error: {e}")
         return None
 
 
 def download_content(videos, media_dir, default_image_duration):
-    """
-    Загружает контент из списка videos, обрабатывает PDF и возвращает словарь
-    {имя_файла: длительность} для всех файлов, которые будут воспроизводиться.
-    """
+    """Загружает контент и возвращает словарь длительностей"""
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[* {now}] Очистка локального контента...")
+    
     if os.path.exists(media_dir):
         for file in os.listdir(media_dir):
             file_path = os.path.join(media_dir, file)
@@ -283,7 +253,9 @@ def download_content(videos, media_dir, default_image_duration):
         try:
             subprocess.run(
                 ['wget', '-O', target_path, v_url],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                check=True, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
             )
         except subprocess.CalledProcessError as e:
             print(f"[! {now}] Ошибка скачивания {v_id}: {e}")
@@ -291,7 +263,6 @@ def download_content(videos, media_dir, default_image_duration):
 
         dur_config = v.get('duration_config')
         if ext == '.pdf':
-            # Обработка PDF
             if dur_config and isinstance(dur_config, dict) and 'pages' in dur_config:
                 page_durs = dur_config['pages']
             else:
@@ -302,17 +273,15 @@ def download_content(videos, media_dir, default_image_duration):
                     dur = default_image_duration
                 durations[os.path.basename(png_path)] = dur
         else:
-            # Видео или изображение
             if dur_config and isinstance(dur_config, dict):
                 dur = dur_config.get('duration')
             else:
                 dur = None
-            # Для изображений, если длительность не указана, подставляем значение по умолчанию
             if ext in ('.png', '.jpg', '.jpeg') and dur is None:
                 dur = default_image_duration
             durations[target_filename] = dur
 
-    # Сохраняем длительности в файл
+    # Сохраняем длительности
     durations_path = os.path.join(media_dir, DURATIONS_FILE)
     try:
         with open(durations_path, 'w') as f:
@@ -324,26 +293,19 @@ def download_content(videos, media_dir, default_image_duration):
     return durations
 
 
-class App:
+class SimpleClient:
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.attributes('-fullscreen', True)
-        self.root.configure(background='black')
-        self.root.config(cursor="none")
-        self.root.withdraw()
-
         self.config = load_config()
         self.last_hb = 0
         self.last_check = 0
         self.is_blocked = False
-
-    def show_curtain(self):
-        self.root.deiconify()
-        self.root.update()
-
-    def hide_curtain(self):
-        self.root.withdraw()
-        self.root.update()
+        self.running = True
+        
+        # Проверяем DISPLAY
+        display = os.environ.get('DISPLAY')
+        if not display:
+            print("[!] Внимание: переменная DISPLAY не установлена. Плеер может не работать.")
+            print("[!] Установите: export DISPLAY=:0.0")
 
     def handle_blocked(self):
         if not self.is_blocked:
@@ -351,7 +313,6 @@ class App:
             print(f"[! {now}] Устройство заблокировано. Остановка воспроизведения.")
             self.is_blocked = True
             stop_player()
-            self.root.after(0, self.show_curtain)
 
     def handle_unblocked(self):
         if self.is_blocked:
@@ -362,22 +323,25 @@ class App:
                 self.config['media_dir'],
                 image_display_duration=self.config.get('image_display_duration', 5)
             )
-            time.sleep(2)
-            self.root.after(0, self.hide_curtain)
 
-    def shutdown(self, *_):
+    def shutdown(self, signum=None, frame=None):
+        print("\n[*] Завершение работы...")
+        self.running = False
         stop_player()
-        self.root.after(0, self.root.destroy)
+        if signum:
+            print(f"[*] Получен сигнал {signum}")
+        exit(0)
 
     def worker_loop(self):
-        # Принудительно проверим контент сразу после старта
-        self.process_check_videos(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        # Проверяем контент сразу после старта
+        self.process_check_videos()
         self.last_check = time.time()
 
-        while True:
+        while self.running:
             now_ts = time.time()
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+            # Heartbeat
             if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
                 status = heartbeat(self.config)
                 self.last_hb = now_ts
@@ -392,15 +356,15 @@ class App:
                 elif status == "invalid":
                     self.handle_blocked()
                     sync_token(self.config)
-                # None — сервер недоступен, ждём следующего heartbeat
 
+            # Check videos
             if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
-                self.process_check_videos(now_str)
+                self.process_check_videos()
                 self.last_check = now_ts
 
             time.sleep(1)
 
-    def process_check_videos(self, now_str):
+    def process_check_videos(self):
         url = f"{self.config['server_url']}/api/check-videos"
         current_ids = get_local_file_ids(self.config['media_dir'])
         payload = {
@@ -409,6 +373,8 @@ class App:
             "videos": current_ids
         }
 
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
         try:
             resp = requests.post(url, json=payload, timeout=10)
             data = resp.json()
@@ -416,7 +382,6 @@ class App:
 
             if status == 205:
                 print(f"[{now_str}] Обновление контента...")
-                self.root.after(0, self.show_curtain)
                 stop_player()
                 download_content(
                     data.get("videos", []),
@@ -427,8 +392,6 @@ class App:
                     self.config['media_dir'],
                     image_display_duration=self.config.get('image_display_duration', 5)
                 )
-                time.sleep(3)
-                self.root.after(0, self.hide_curtain)
 
             elif status == 204:
                 global player_process
@@ -448,18 +411,26 @@ class App:
             print(f"[{now_str}] Ошибка check_videos: {e}")
 
     def run(self):
+        # Устанавливаем обработчики сигналов
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
-
-        def _poll():
-            self.root.after(200, _poll)
-        _poll()
-
+        
+        print("[*] Запуск клиента...")
+        print(f"[*] Media directory: {self.config['media_dir']}")
+        print(f"[*] Server: {self.config['server_url']}")
+        
+        # Запускаем рабочий цикл
         t = threading.Thread(target=self.worker_loop, daemon=True)
         t.start()
-        self.root.mainloop()
+        
+        # Держим основной поток живым
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.shutdown()
 
 
 if __name__ == "__main__":
-    app = App()
-    app.run()
+    client = SimpleClient()
+    client.run()
