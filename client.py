@@ -75,7 +75,7 @@ def start_player(media_dir, image_display_duration=5):
 
     def _sequential_playback():
         global player_process
-        print(f"[Player {now}] Запущен последовательный плеер (скрытый режим)")
+        print(f"[Player {now}] Запущен последовательный плеер")
 
         # Загружаем длительности один раз
         durations = {}
@@ -88,7 +88,7 @@ def start_player(media_dir, image_display_duration=5):
             except Exception as e:
                 print(f"[Player {now}] Ошибка чтения .durations.json: {e}")
 
-        # Собираем все файлы
+        # Собираем все файлы (кроме служебного)
         all_files = []
         for f in os.listdir(media_dir):
             if f == DURATIONS_FILE:
@@ -108,29 +108,19 @@ def start_player(media_dir, image_display_duration=5):
                     break
 
                 base = os.path.basename(filepath)
-                dur = durations.get(base)
+                dur = durations.get(base)         
                 ext = os.path.splitext(filepath)[1].lower()
 
-                # === УЛУЧШЕННАЯ КОМАНДА MPV ===
-                cmd = [
-                    "mpv",
-                    "--fs",                    # fullscreen
-                    "--no-osc",                # без интерфейса
-                    "--no-audio",
-                    "--really-quiet",          # минимум логов
-                    "--force-window=immediate",# сразу создаём окно
-                    "--wid=0",                 # без родительского окна (важно!)
-                    "--input-conf=/dev/null",  # отключить все горячие клавиши
-                    "--cursor-autohide=0",     # не прятать курсор
-                ]
+                # Формируем команду ТОЛЬКО для одного файла
+                cmd = ["mpv", "--fs", "--no-osc", "--no-audio"]
 
-                # Длительность
                 if dur is not None:
                     if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
                         cmd.extend([f'--length={float(dur)}', filepath])
                     else:
                         cmd.extend([f'--image-display-duration={float(dur)}', filepath])
                 else:
+                    # fallback только если в json почему-то нет записи
                     if ext in ('.png', '.jpg', '.jpeg'):
                         cmd.extend([f'--image-display-duration={float(image_display_duration)}', filepath])
                     else:
@@ -139,22 +129,14 @@ def start_player(media_dir, image_display_duration=5):
                 print(f"[Player {now}] → {base}  длительность: {dur or image_display_duration} сек.")
 
                 try:
-                    # Запуск без создания окна терминала (самое важное для macOS)
-                    startupinfo = None
-                    if os.name == 'nt':  # Windows
-                        startupinfo = subprocess.STARTUPINFO()
-                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                        startupinfo.wShowWindow = subprocess.SW_HIDE
-
                     player_process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                        preexec_fn=os.setsid if os.name != 'nt' else None,
-                        startupinfo=startupinfo
+                        preexec_fn=os.setsid
                     )
 
-                    # Ждём завершения файла
+                    # Ждём завершения этого файла или сигнала остановки
                     while player_process.poll() is None:
                         if playback_stop_event.is_set():
                             try:
@@ -162,7 +144,7 @@ def start_player(media_dir, image_display_duration=5):
                             except:
                                 pass
                             break
-                        time.sleep(0.15)
+                        time.sleep(0.1)
 
                     player_process = None
 
@@ -171,9 +153,9 @@ def start_player(media_dir, image_display_duration=5):
                     player_process = None
                     time.sleep(0.5)
 
-    # Запускаем в отдельном потоке
+    # Запускаем последовательное воспроизведение в отдельном потоке
     threading.Thread(target=_sequential_playback, daemon=True).start()
-    print(f"[Player {now}] Последовательный плеер запущен в скрытом режиме")
+    print(f"[Player {now}] Последовательный плеер запущен")
 
 
 def load_config():
