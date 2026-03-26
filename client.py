@@ -19,7 +19,7 @@ PDF_PAGE_RE = re.compile(r'^(.+)_p-(\d+)\.png$')
 VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
 MPV_SOCKET_TIMEOUT = 5
-MPV_EVENT_POLL_INTERVAL = 0.5
+MPV_EVENT_POLL_INTERVAL = 0.1
 
 player_process = None
 player_thread = None
@@ -188,25 +188,26 @@ class MpvIpcClient:
                 return response
 
     def load_file(self, filepath, ext, duration):
-        options = {}
-        if duration is not None:
-            if ext in VIDEO_EXTENSIONS:
-                options["length"] = str(duration)
-            elif ext in IMAGE_EXTENSIONS:
-                options["image-display-duration"] = str(duration)
+        if duration is not None and ext in IMAGE_EXTENSIONS:
+            self.send_command(["set_property", "image-display-duration", duration])
 
-        command = ["loadfile", filepath, "replace"]
-        if options:
-            command.extend([-1, options])
         self.pending_events.clear()
-        self.send_command(command)
+        self.send_command(["loadfile", filepath, "replace"])
 
-    def wait_until_file_ends(self, process, stop_event):
+    def wait_until_file_ends(self, process, stop_event, ext, duration):
+        stop_sent = False
+        playback_started_at = time.monotonic()
+
         while not stop_event.is_set():
             if process.poll() is not None:
                 raise RuntimeError(f"mpv неожиданно завершился с кодом {process.returncode}")
 
-            event = self.next_event()
+            if duration is not None and ext in VIDEO_EXTENSIONS and not stop_sent:
+                if time.monotonic() - playback_started_at >= duration:
+                    self.send_command(["stop"])
+                    stop_sent = True
+
+            event = self.next_event(timeout=MPV_EVENT_POLL_INTERVAL)
             if event is None:
                 continue
 
@@ -293,7 +294,12 @@ def start_player(media_dir, image_display_duration=5):
 
                     try:
                         client.load_file(entry["path"], entry["ext"], entry["duration"])
-                        client.wait_until_file_ends(player_process, playback_stop_event)
+                        client.wait_until_file_ends(
+                            player_process,
+                            playback_stop_event,
+                            entry["ext"],
+                            entry["duration"],
+                        )
                     except RuntimeError as e:
                         if str(e) != "Воспроизведение остановлено":
                             print(f"[Player {now}] Ошибка IPC/mpv для {entry['base']}: {e}")
