@@ -52,7 +52,7 @@ def start_player(media_dir, image_display_duration=5):
         print(f"[Player {now}] Нет файлов для воспроизведения.")
         return
 
-    # Загружаем длительности, если есть
+    # Загружаем длительности
     durations = {}
     durations_path = os.path.join(media_dir, DURATIONS_FILE)
     if os.path.exists(durations_path):
@@ -63,51 +63,52 @@ def start_player(media_dir, image_display_duration=5):
         except Exception as e:
             print(f"[Player {now}] Ошибка загрузки длительностей: {e}")
 
-    # Формируем команду mpv
-    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio"]
-    
-    # Добавляем видео-вывод, если указан в конфиге
-    video_output = os.environ.get('MPV_VO', 'x11')
-    cmd.append(f'--vo={video_output}')  # Исправлено
-    
-    for filepath in all_files:
-        base = os.path.basename(filepath)
-        dur = durations.get(base)
-        ext = os.path.splitext(filepath)[1].lower()
-
-        if dur is not None:
-            # Если длительность задана, применяем опцию в зависимости от типа файла
-            if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
-                cmd.append(f'--length={dur}')  # Исправлено
+    # Создаем временный файл плейлиста с командами
+    playlist_file = os.path.join(media_dir, "_playlist.txt")
+    with open(playlist_file, 'w') as f:
+        for filepath in all_files:
+            base = os.path.basename(filepath)
+            dur = durations.get(base)
+            ext = os.path.splitext(filepath)[1].lower()
+            
+            if dur is not None and dur > 0:
+                if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v'):
+                    # Для видео используем опцию length
+                    f.write(f"{filepath}\n")
+                    f.write(f"set playback-time {dur}\n")
+                else:
+                    # Для изображений используем image-display-duration
+                    f.write(f"{filepath}\n")
+                    f.write(f"set image-display-duration {dur}\n")
             else:
-                # Изображения, png, jpg и т.д.
-                cmd.append(f'--image-display-duration={dur}')  # Исправлено
-        else:
-            # Нет данных о длительности – используем старую логику
-            if ext in ('.png', '.jpg', '.jpeg'):
-                # Для изображений применяем глобальную настройку
-                cmd.append(f'--image-display-duration={image_display_duration}')  # Исправлено
-        cmd.append(filepath)
-
-    print(f"[Player {now}] Команда: {' '.join(cmd[:20])}...")  # Выводим начало команды
-    print(f"[Player {now}] Запуск воспроизведения {len(all_files)} файлов.")
+                f.write(f"{filepath}\n")
+                if ext in ('.png', '.jpg', '.jpeg', '.gif', '.bmp'):
+                    f.write(f"set image-display-duration {image_display_duration}\n")
+    
+    # Запускаем mpv с плейлистом
+    cmd = [
+        "mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio",
+        f"--vo={os.environ.get('MPV_VO', 'x11')}",
+        f"--playlist={playlist_file}"
+    ]
+    
+    print(f"[Player {now}] Команда: {' '.join(cmd)}")
+    print(f"[Player {now}] Плейлист создан: {playlist_file}")
     
     try:
-        # Создаем окружение с DISPLAY
         env = os.environ.copy()
         if 'DISPLAY' not in env:
             env['DISPLAY'] = ':0.0'
             
         player_process = subprocess.Popen(
             cmd,
-            stdout=None,  # Временно выводим для отладки
-            stderr=None,  # Временно выводим для отладки
+            stdout=None,
+            stderr=None,
             preexec_fn=os.setsid,
             env=env
         )
         print(f"[Player {now}] Запущен процесс {player_process.pid}")
         
-        # Небольшая задержка для проверки, не упал ли процесс сразу
         time.sleep(2)
         if player_process.poll() is not None:
             print(f"[Player {now}] Плеер завершился с кодом {player_process.returncode}")
