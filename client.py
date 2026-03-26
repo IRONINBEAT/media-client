@@ -136,6 +136,8 @@ def start_player(media_dir, image_display_duration=5):
                         preexec_fn=os.setsid
                     )
 
+                    time.sleep(0.3)
+
                     # Ждём завершения этого файла или сигнала остановки
                     while player_process.poll() is None:
                         if playback_stop_event.is_set():
@@ -413,11 +415,16 @@ class App:
         self.is_blocked = False
 
     def show_curtain(self):
+        # Поднимаем черное окно на самый верх
         self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
         self.root.update()
 
     def hide_curtain(self):
-        self.root.withdraw()
+        # Убираем приоритет "поверх всех", чтобы mpv мог рисовать поверх
+        self.root.attributes("-topmost", False)
+        self.root.lower()
         self.root.update()
 
     def handle_blocked(self):
