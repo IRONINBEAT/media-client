@@ -12,10 +12,10 @@ import signal
 from urllib.parse import urlparse
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-player_process = None
+DURATIONS_FILE = ".durations.json"
+PDF_PAGE_RE = re.compile(r'^(.+)_p-(\d+)\.png$')
 
-# Паттерн имён файлов, полученных из PDF: {file_id}_p-001.png
-PDF_PAGE_RE = re.compile(r'^(.+)_p-\d+\.png$')
+player_process = None
 
 
 class BlackCurtain:
@@ -60,26 +60,59 @@ def stop_player():
             print(f"[Player {now}] Ошибка при остановке плеера: {e}")
 
 
-def start_player(media_dir, image_duration=5):
+def start_player(media_dir, image_display_duration=5):
     global player_process
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    files = sorted([
-        os.path.join(media_dir, f)
-        for f in os.listdir(media_dir)
-        if os.path.isfile(os.path.join(media_dir, f))
-    ])
+    # Список всех файлов в папке, исключая служебные
+    all_files = []
+    for f in os.listdir(media_dir):
+        if f == DURATIONS_FILE:
+            continue
+        full = os.path.join(media_dir, f)
+        if os.path.isfile(full):
+            all_files.append(full)
+    all_files.sort()
 
-    if not files:
+    if not all_files:
         print(f"[Player {now}] Нет файлов для воспроизведения.")
         return
 
-    print(f"[Player {now}] Запуск воспроизведения {len(files)} файлов.")
-    cmd = [
-        "mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio",
-        f"--image-display-duration={image_duration}",
-    ] + files
+    # Загружаем длительности, если есть
+    durations = {}
+    durations_path = os.path.join(media_dir, DURATIONS_FILE)
+    if os.path.exists(durations_path):
+        try:
+            with open(durations_path, 'r') as f:
+                durations = json.load(f)
+            print(f"[Player {now}] Загружены длительности для {len(durations)} файлов.")
+        except Exception as e:
+            print(f"[Player {now}] Ошибка загрузки длительностей: {e}")
 
+    # Формируем команду mpv
+    cmd = ["mpv", "--fs", "--loop-playlist", "--no-osc", "--no-audio"]
+    for filepath in all_files:
+        base = os.path.basename(filepath)
+        dur = durations.get(base)
+        ext = os.path.splitext(filepath)[1].lower()
+
+        if dur is not None:
+            # Если длительность задана, применяем опцию в зависимости от типа файла
+            if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
+                cmd.extend(['--length', str(dur)])
+            else:
+                # Изображения, png, jpg и т.д.
+                cmd.extend(['--image-display-duration', str(dur)])
+        else:
+            # Нет данных о длительности – используем старую логику
+            if ext in ('.png', '.jpg', '.jpeg'):
+                # Для изображений применяем глобальную настройку из конфига
+                # Чтобы она действовала только на этот файл, нужно указать перед ним
+                cmd.extend(['--image-display-duration', str(image_display_duration)])
+            # Для видео без ограничения – не добавляем опций
+        cmd.append(filepath)
+
+    print(f"[Player {now}] Запуск воспроизведения {len(all_files)} файлов.")
     try:
         player_process = subprocess.Popen(
             cmd,
@@ -117,7 +150,11 @@ def get_local_file_ids(media_dir):
     return list(ids)
 
 
-def convert_pdf_to_images(pdf_path, file_id, media_dir):
+def convert_pdf_to_images(pdf_path, file_id, media_dir, page_durations=None):
+    """
+    Конвертирует PDF в PNG и возвращает список (путь к PNG, длительность) для каждой страницы.
+    page_durations: список длительностей страниц, если задан.
+    """
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     prefix = os.path.join(media_dir, f"{file_id}_p")
     try:
@@ -125,8 +162,14 @@ def convert_pdf_to_images(pdf_path, file_id, media_dir):
             ['pdftoppm', '-r', '150', '-png', pdf_path, prefix],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        pages = glob.glob(f"{prefix}-*.png")
+        pages = sorted(glob.glob(f"{prefix}-*.png"))
         print(f"[* {now}] PDF {file_id} → {len(pages)} стр.")
+
+        result = []
+        for i, png_path in enumerate(pages):
+            dur = page_durations[i] if page_durations and i < len(page_durations) else None
+            result.append((png_path, dur))
+        return result
     except FileNotFoundError:
         print(f"[! {now}] pdftoppm не найден. Установите: sudo apt install poppler-utils")
     except subprocess.CalledProcessError as e:
@@ -136,6 +179,7 @@ def convert_pdf_to_images(pdf_path, file_id, media_dir):
             os.remove(pdf_path)
         except OSError:
             pass
+    return []
 
 
 def sync_token(config):
@@ -204,7 +248,11 @@ def heartbeat(config):
         return None
 
 
-def download_content(videos, media_dir):
+def download_content(videos, media_dir, default_image_duration):
+    """
+    Загружает контент из списка videos, обрабатывает PDF и возвращает словарь
+    {имя_файла: длительность} для всех файлов, которые будут воспроизводиться.
+    """
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[* {now}] Очистка локального контента...")
     if os.path.exists(media_dir):
@@ -218,6 +266,8 @@ def download_content(videos, media_dir):
     else:
         os.makedirs(media_dir)
 
+    durations = {}
+
     for v in videos:
         v_id = v['id']
         v_url = v['url']
@@ -225,6 +275,7 @@ def download_content(videos, media_dir):
         target_filename = f"{v_id}{ext}"
         target_path = os.path.join(media_dir, target_filename)
         print(f"[* {now}] Загрузка {v_id} ({ext}) -> {target_filename}")
+
         try:
             subprocess.run(
                 ['wget', '-O', target_path, v_url],
@@ -233,8 +284,40 @@ def download_content(videos, media_dir):
         except subprocess.CalledProcessError as e:
             print(f"[! {now}] Ошибка скачивания {v_id}: {e}")
             continue
+
+        dur_config = v.get('duration_config')
         if ext == '.pdf':
-            convert_pdf_to_images(target_path, v_id, media_dir)
+            # Обработка PDF
+            if dur_config and isinstance(dur_config, dict) and 'pages' in dur_config:
+                page_durs = dur_config['pages']
+            else:
+                page_durs = None
+            pages = convert_pdf_to_images(target_path, v_id, media_dir, page_durs)
+            for png_path, dur in pages:
+                if dur is None:
+                    dur = default_image_duration
+                durations[os.path.basename(png_path)] = dur
+        else:
+            # Видео или изображение
+            if dur_config and isinstance(dur_config, dict):
+                dur = dur_config.get('duration')
+            else:
+                dur = None
+            # Для изображений, если длительность не указана, подставляем значение по умолчанию
+            if ext in ('.png', '.jpg', '.jpeg') and dur is None:
+                dur = default_image_duration
+            durations[target_filename] = dur
+
+    # Сохраняем длительности в файл
+    durations_path = os.path.join(media_dir, DURATIONS_FILE)
+    try:
+        with open(durations_path, 'w') as f:
+            json.dump(durations, f)
+        print(f"[* {now}] Длительности сохранены в {durations_path}")
+    except Exception as e:
+        print(f"[! {now}] Ошибка сохранения длительностей: {e}")
+
+    return durations
 
 
 class App:
@@ -273,7 +356,7 @@ class App:
             self.is_blocked = False
             start_player(
                 self.config['media_dir'],
-                image_duration=self.config.get('image_display_duration', 5)
+                image_display_duration=self.config.get('image_display_duration', 5)
             )
             time.sleep(2)
             self.root.after(0, self.hide_curtain)
@@ -283,6 +366,10 @@ class App:
         self.root.after(0, self.root.destroy)
 
     def worker_loop(self):
+        # Принудительно проверим контент сразу после старта
+        self.process_check_videos(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        self.last_check = time.time()
+
         while True:
             now_ts = time.time()
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -294,7 +381,6 @@ class App:
                 if status == "blocked":
                     self.handle_blocked()
                 elif status == "unauthorized":
-                    # Останавливаем воспроизведение и пробуем обновить токен
                     self.handle_blocked()
                     sync_token(self.config)
                 elif status == "ok":
@@ -304,7 +390,6 @@ class App:
                     sync_token(self.config)
                 # None — сервер недоступен, ждём следующего heartbeat
 
-            # check-videos пропускаем пока устройство заблокировано
             if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
                 self.process_check_videos(now_str)
                 self.last_check = now_ts
@@ -329,10 +414,14 @@ class App:
                 print(f"[{now_str}] Обновление контента...")
                 self.root.after(0, self.show_curtain)
                 stop_player()
-                download_content(data.get("videos", []), self.config['media_dir'])
+                download_content(
+                    data.get("videos", []),
+                    self.config['media_dir'],
+                    self.config.get('image_display_duration', 5)
+                )
                 start_player(
                     self.config['media_dir'],
-                    image_duration=self.config.get('image_display_duration', 5)
+                    image_display_duration=self.config.get('image_display_duration', 5)
                 )
                 time.sleep(3)
                 self.root.after(0, self.hide_curtain)
@@ -342,7 +431,7 @@ class App:
                 if player_process is None or player_process.poll() is not None:
                     start_player(
                         self.config['media_dir'],
-                        image_duration=self.config.get('image_display_duration', 5)
+                        image_display_duration=self.config.get('image_display_duration', 5)
                     )
 
             elif status == 401:
