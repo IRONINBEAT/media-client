@@ -68,7 +68,7 @@ def start_player(media_dir, image_display_duration=5):
     
     # Добавляем видео-вывод, если указан в конфиге
     video_output = os.environ.get('MPV_VO', 'x11')
-    cmd.extend(['--vo', video_output])
+    cmd.append(f'--vo={video_output}')  # Исправлено
     
     for filepath in all_files:
         base = os.path.basename(filepath)
@@ -78,15 +78,15 @@ def start_player(media_dir, image_display_duration=5):
         if dur is not None:
             # Если длительность задана, применяем опцию в зависимости от типа файла
             if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
-                cmd.extend(['--length', str(dur)])
+                cmd.append(f'--length={dur}')  # Исправлено
             else:
                 # Изображения, png, jpg и т.д.
-                cmd.extend(['--image-display-duration', str(dur)])
+                cmd.append(f'--image-display-duration={dur}')  # Исправлено
         else:
             # Нет данных о длительности – используем старую логику
             if ext in ('.png', '.jpg', '.jpeg'):
                 # Для изображений применяем глобальную настройку
-                cmd.extend(['--image-display-duration', str(image_display_duration)])
+                cmd.append(f'--image-display-duration={image_display_duration}')  # Исправлено
         cmd.append(filepath)
 
     print(f"[Player {now}] Команда: {' '.join(cmd[:20])}...")  # Выводим начало команды
