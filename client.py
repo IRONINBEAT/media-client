@@ -423,12 +423,7 @@ class App:
         self.root.attributes('-fullscreen', True)
         self.root.configure(background='black')
         self.root.config(cursor="none")
-        
-        self.root.withdraw()                    # главное окно скрыто
-        self.root.overrideredirect(True)        # убираем рамку окна
-        self.root.attributes('-alpha', 0.0)    
-        
-        self.root.withdraw()  
+        self.root.withdraw()
 
         self.config = load_config()
         self.last_hb = 0
