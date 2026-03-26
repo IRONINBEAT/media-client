@@ -19,48 +19,22 @@ PLAYER_WINDOW_SETTLE_TIME = 0.3
 
 player_process = None
 playback_stop_event = threading.Event()
+curtain_state_lock = threading.Lock()
+pending_curtain_state = None
 
 
-class BlackCurtain:
-    def __init__(self):
-        self.root = None
-        self.thread = None
-        self._lock = threading.Lock()
-
-    def _create_window(self):
-        self.root = tk.Tk()
-        self.root.attributes('-fullscreen', True)
-        self.root.configure(background='black')
-        self.root.config(cursor="none")
-        self.root.bind("<Escape>", lambda e: self.stop())
-        self.root.mainloop()
-
-    def start(self):
-        with self._lock:
-            if self.thread and self.thread.is_alive():
-                return
-            self.thread = threading.Thread(target=self._create_window, daemon=True)
-            self.thread.start()
-
-        for _ in range(20):
-            if self.root is not None:
-                break
-            time.sleep(0.01)
-
-    def stop(self):
-        with self._lock:
-            root = self.root
-            thread = self.thread
-            self.root = None
-            self.thread = None
-
-        if root:
-            root.after(0, root.destroy)
-        if thread and thread.is_alive():
-            thread.join(timeout=1)
+def request_curtain(visible):
+    global pending_curtain_state
+    with curtain_state_lock:
+        pending_curtain_state = visible
 
 
-curtain = BlackCurtain()
+def consume_curtain_request():
+    global pending_curtain_state
+    with curtain_state_lock:
+        requested_state = pending_curtain_state
+        pending_curtain_state = None
+    return requested_state
 
 
 def stop_player():
@@ -169,7 +143,7 @@ def start_player(media_dir, image_display_duration=5):
                         if planned_duration is not None and not transition_started:
                             elapsed = time.monotonic() - playback_started_at
                             if elapsed >= max(0, planned_duration - TRANSITION_CURTAIN_LEAD_TIME):
-                                curtain.start()
+                                request_curtain(True)
                                 transition_started = True
                         time.sleep(0.1)
 
@@ -183,7 +157,7 @@ def start_player(media_dir, image_display_duration=5):
                     player_process = None
                     time.sleep(0.5)
                 finally:
-                    curtain.stop()
+                    request_curtain(False)
 
     # Запускаем последовательное воспроизведение в отдельном потоке
     threading.Thread(target=_sequential_playback, daemon=True).start()
@@ -458,7 +432,7 @@ class App:
             print(f"[! {now}] Устройство заблокировано. Остановка воспроизведения.")
             self.is_blocked = True
             stop_player()
-            self.root.after(0, self.show_curtain)
+            request_curtain(True)
 
     def handle_unblocked(self):
         if self.is_blocked:
@@ -470,7 +444,7 @@ class App:
                 image_display_duration=self.config.get('image_display_duration', 5)
             )
             time.sleep(2)
-            self.root.after(0, self.hide_curtain)
+            request_curtain(False)
 
     def shutdown(self, *_):
         stop_player()
@@ -529,7 +503,7 @@ class App:
 
             if status == 205:
                 print(f"[{now_str}] Обновление контента...")
-                self.root.after(0, self.show_curtain)
+                request_curtain(True)
                 stop_player()
                 download_content(
                     data.get("videos", []),
@@ -541,7 +515,7 @@ class App:
                     image_display_duration=self.config.get('image_display_duration', 5)
                 )
                 time.sleep(3)
-                self.root.after(0, self.hide_curtain)
+                request_curtain(False)
 
             elif status == 204:
                 global player_process
@@ -565,6 +539,11 @@ class App:
         signal.signal(signal.SIGTERM, self.shutdown)
 
         def _poll():
+            requested_state = consume_curtain_request()
+            if requested_state is True:
+                self.show_curtain()
+            elif requested_state is False:
+                self.hide_curtain()
             self.root.after(200, _poll)
         _poll()
 
