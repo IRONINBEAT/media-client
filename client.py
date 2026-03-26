@@ -159,8 +159,44 @@ def start_player(media_dir, image_display_duration=5):
 
 
 def load_config():
+    """Загружает и валидирует конфигурацию клиента"""
+    if not os.path.exists(CONFIG_FILE):
+        raise FileNotFoundError(f"Файл конфигурации не найден: {CONFIG_FILE}")
+    
     with open(CONFIG_FILE, 'r') as f:
-        return json.load(f)
+        config = json.load(f)
+
+    # === ВАЛИДАЦИЯ ИНТЕРВАЛОВ ===
+    defaults = {
+        "heartbeat_interval": 30,      # секунд
+        "check_videos_interval": 180,  # секунд (рекомендую 3 минуты)
+        "image_display_duration": 5,
+        "server_url": "http://217.71.129.139:4085",
+        "device_id": "NSTU_OrangePI2302",
+        "media_dir": "./content",
+        "token": ""
+    }
+
+    for key, default_value in defaults.items():
+        if key not in config or not isinstance(config[key], (int, float, str)):
+            print(f"[Config] Предупреждение: ключ '{key}' отсутствует или некорректен. Используем значение по умолчанию: {default_value}")
+            config[key] = default_value
+
+    # Ограничения на интервалы
+    config["heartbeat_interval"] = max(15, min(120, int(config["heartbeat_interval"])))      # 15..120 сек
+    config["check_videos_interval"] = max(60, min(600, int(config["check_videos_interval"]))) # 1..10 минут
+
+    # Принудительно приводим media_dir к абсолютному пути
+    if not os.path.isabs(config["media_dir"]):
+        config["media_dir"] = os.path.abspath(config["media_dir"])
+
+    print(f"[Config] Загружены интервалы:")
+    print(f"   Heartbeat          → {config['heartbeat_interval']} сек")
+    print(f"   Check videos       → {config['check_videos_interval']} сек")
+    print(f"   Изображения по умолчанию → {config.get('image_display_duration', 5)} сек")
+    print(f"   Media dir          → {config['media_dir']}")
+
+    return config
 
 
 def save_config(config):
@@ -409,31 +445,37 @@ class App:
         self.root.after(0, self.root.destroy)
 
     def worker_loop(self):
-        # Принудительно проверим контент сразу после старта
-        self.process_check_videos(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Первая проверка контента сразу после старта
+        print(f"[{now_str}] Начальная проверка контента после запуска...")
+        self.process_check_videos(now_str)
         self.last_check = time.time()
+        self.last_hb = time.time()
+
+        print(f"[Info] Клиент запущен. Heartbeat: {self.config['heartbeat_interval']}с, Check: {self.config['check_videos_interval']}с")
 
         while True:
             now_ts = time.time()
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            if now_ts - self.last_hb > self.config.get('heartbeat_interval', 30):
+            # === HEARTBEAT ===
+            if now_ts - self.last_hb >= self.config['heartbeat_interval']:
                 status = heartbeat(self.config)
                 self.last_hb = now_ts
 
                 if status == "blocked":
                     self.handle_blocked()
-                elif status == "unauthorized":
+                elif status in ("unauthorized", "invalid"):
                     self.handle_blocked()
                     sync_token(self.config)
                 elif status == "ok":
                     self.handle_unblocked()
-                elif status == "invalid":
-                    self.handle_blocked()
-                    sync_token(self.config)
-                # None — сервер недоступен, ждём следующего heartbeat
 
-            if not self.is_blocked and now_ts - self.last_check > self.config.get('check_videos_interval', 60):
+            # === CHECK VIDEOS ===
+            if (not self.is_blocked and 
+                now_ts - self.last_check >= self.config['check_videos_interval']):
+                
                 self.process_check_videos(now_str)
                 self.last_check = now_ts
 
@@ -454,8 +496,8 @@ class App:
             status = data.get("status")
 
             if status == 205:
-                print(f"[{now_str}] Обновление контента (205)...")
-                self.root.after(0, self.show_curtain)      # гасим экран только при реальном обновлении
+                print(f"[{now_str}] Обновление контента...")
+                self.root.after(0, self.show_curtain)
                 stop_player()
                 download_content(
                     data.get("videos", []),
@@ -470,13 +512,14 @@ class App:
                 self.root.after(0, self.hide_curtain)
 
             elif status == 204:
-                # === ИСПРАВЛЕНИЕ ===
-                # Файлы полностью актуальны → НЕ трогаем плеер вообще
-                print(f"[{now_str}] Контент актуален (204). Продолжаем текущее воспроизведение без перезапуска.")
-                # Никакого start_player() и stop_player() здесь больше нет
+                global player_process
+                if player_process is None or player_process.poll() is not None:
+                    start_player(
+                        self.config['media_dir'],
+                        image_display_duration=self.config.get('image_display_duration', 5)
+                    )
 
             elif status == 401:
-                print(f"[{now_str}] Токен устарел (401). Запуск синхронизации...")
                 sync_token(self.config)
 
             elif status == 403:
