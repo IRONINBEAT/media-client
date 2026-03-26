@@ -20,19 +20,9 @@ playback_stop_event = threading.Event()
 
 
 class BlackCurtain:
-    """Полноэкранное чёрное окно, которое можно показывать и скрывать."""
     def __init__(self):
         self.root = None
         self.thread = None
-        self.ready = threading.Event()
-        self._start_thread()
-
-    def _start_thread(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._create_window, daemon=True)
-        self.thread.start()
-        self.ready.wait()  # ждём, пока окно создано
 
     def _create_window(self):
         self.root = tk.Tk()
@@ -40,36 +30,20 @@ class BlackCurtain:
         self.root.configure(background='black')
         self.root.config(cursor="none")
         self.root.bind("<Escape>", lambda e: self.stop())
-        self.root.withdraw()  # изначально скрыто
-        self.ready.set()
         self.root.mainloop()
 
     def start(self):
-        """Показать чёрный экран."""
-        if self.root:
-            self.root.after(0, self._show)
-
-    def _show(self):
-        if self.root:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._create_window, daemon=True)
+        self.thread.start()
+        time.sleep(1)
 
     def stop(self):
-        """Скрыть чёрный экран."""
-        if self.root:
-            self.root.after(0, self._hide)
-
-    def _hide(self):
-        if self.root:
-            self.root.withdraw()
-
-    def shutdown(self):
-        """Уничтожить окно при выходе."""
         if self.root:
             self.root.after(0, self.root.destroy)
-            if self.thread:
-                self.thread.join(timeout=1)
+            self.thread.join()
+            self.root = None
 
 
 curtain = BlackCurtain()
@@ -81,9 +55,6 @@ def stop_player():
     
     # Сигналим всем потокам остановки
     playback_stop_event.set()
-    
-    # Скрываем чёрный экран, если он был показан
-    curtain.stop()
     
     if player_process:
         try:
@@ -132,7 +103,7 @@ def start_player(media_dir, image_display_duration=5):
             return
 
         while not playback_stop_event.is_set():
-            for idx, filepath in enumerate(all_files):
+            for filepath in all_files:
                 if playback_stop_event.is_set():
                     break
 
@@ -156,9 +127,6 @@ def start_player(media_dir, image_display_duration=5):
                         cmd.append(filepath)
 
                 print(f"[Player {now}] → {base}  длительность: {dur or image_display_duration} сек.")
-
-                # Скрываем чёрный экран перед запуском (если он был показан после предыдущего файла)
-                curtain.stop()
 
                 try:
                     player_process = subprocess.Popen(
@@ -184,14 +152,6 @@ def start_player(media_dir, image_display_duration=5):
                     print(f"[Player {now}] Ошибка запуска mpv для {base}: {e}")
                     player_process = None
                     time.sleep(0.5)
-
-                # После завершения файла показываем чёрный экран, если это не последний файл в списке
-                # (или всегда, кроме случая, когда была остановка)
-                if not playback_stop_event.is_set():
-                    # Если после текущего файла есть следующий (или мы дошли до конца и цикл пойдёт сначала)
-                    curtain.start()
-                    # Небольшая задержка, чтобы окно успело появиться
-                    time.sleep(0.05)
 
     # Запускаем последовательное воспроизведение в отдельном потоке
     threading.Thread(target=_sequential_playback, daemon=True).start()
@@ -481,7 +441,6 @@ class App:
             self.root.after(0, self.hide_curtain)
 
     def shutdown(self, *_):
-        curtain.shutdown()      # закрываем отдельный чёрный экран
         stop_player()
         self.root.after(0, self.root.destroy)
 
