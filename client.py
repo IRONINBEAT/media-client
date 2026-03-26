@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 DURATIONS_FILE = ".durations.json"
 PDF_PAGE_RE = re.compile(r'^(.+)_p-(\d+)\.png$')
+TRANSITION_CURTAIN_LEAD_TIME = 0.2
+PLAYER_WINDOW_SETTLE_TIME = 0.3
 
 player_process = None
 playback_stop_event = threading.Event()
@@ -23,6 +25,7 @@ class BlackCurtain:
     def __init__(self):
         self.root = None
         self.thread = None
+        self._lock = threading.Lock()
 
     def _create_window(self):
         self.root = tk.Tk()
@@ -33,17 +36,28 @@ class BlackCurtain:
         self.root.mainloop()
 
     def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._create_window, daemon=True)
-        self.thread.start()
-        time.sleep(1)
+        with self._lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._create_window, daemon=True)
+            self.thread.start()
+
+        for _ in range(20):
+            if self.root is not None:
+                break
+            time.sleep(0.01)
 
     def stop(self):
-        if self.root:
-            self.root.after(0, self.root.destroy)
-            self.thread.join()
+        with self._lock:
+            root = self.root
+            thread = self.thread
             self.root = None
+            self.thread = None
+
+        if root:
+            root.after(0, root.destroy)
+        if thread and thread.is_alive():
+            thread.join(timeout=1)
 
 
 curtain = BlackCurtain()
@@ -110,31 +124,38 @@ def start_player(media_dir, image_display_duration=5):
                 base = os.path.basename(filepath)
                 dur = durations.get(base)         
                 ext = os.path.splitext(filepath)[1].lower()
+                planned_duration = None
 
                 # Формируем команду ТОЛЬКО для одного файла
                 cmd = ["mpv", "--fs", "--no-osc", "--no-audio"]
 
                 if dur is not None:
                     if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
-                        cmd.extend([f'--length={float(dur)}', filepath])
+                        planned_duration = float(dur)
+                        cmd.extend([f'--length={planned_duration}', filepath])
                     else:
-                        cmd.extend([f'--image-display-duration={float(dur)}', filepath])
+                        planned_duration = float(dur)
+                        cmd.extend([f'--image-display-duration={planned_duration}', filepath])
                 else:
                     # fallback только если в json почему-то нет записи
                     if ext in ('.png', '.jpg', '.jpeg'):
-                        cmd.extend([f'--image-display-duration={float(image_display_duration)}', filepath])
+                        planned_duration = float(image_display_duration)
+                        cmd.extend([f'--image-display-duration={planned_duration}', filepath])
                     else:
                         cmd.append(filepath)
 
                 print(f"[Player {now}] → {base}  длительность: {dur or image_display_duration} сек.")
 
                 try:
+                    transition_started = False
                     player_process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         preexec_fn=os.setsid
                     )
+
+                    playback_started_at = time.monotonic()
 
                     # Ждём завершения этого файла или сигнала остановки
                     while player_process.poll() is None:
@@ -144,7 +165,16 @@ def start_player(media_dir, image_display_duration=5):
                             except:
                                 pass
                             break
+
+                        if planned_duration is not None and not transition_started:
+                            elapsed = time.monotonic() - playback_started_at
+                            if elapsed >= max(0, planned_duration - TRANSITION_CURTAIN_LEAD_TIME):
+                                curtain.start()
+                                transition_started = True
                         time.sleep(0.1)
+
+                    if transition_started and not playback_stop_event.is_set():
+                        time.sleep(PLAYER_WINDOW_SETTLE_TIME)
 
                     player_process = None
 
@@ -152,6 +182,8 @@ def start_player(media_dir, image_display_duration=5):
                     print(f"[Player {now}] Ошибка запуска mpv для {base}: {e}")
                     player_process = None
                     time.sleep(0.5)
+                finally:
+                    curtain.stop()
 
     # Запускаем последовательное воспроизведение в отдельном потоке
     threading.Thread(target=_sequential_playback, daemon=True).start()
