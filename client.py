@@ -454,8 +454,8 @@ class App:
             status = data.get("status")
 
             if status == 205:
-                print(f"[{now_str}] Обновление контента...")
-                self.root.after(0, self.show_curtain)
+                print(f"[{now_str}] Обновление контента (205)...")
+                self.root.after(0, self.show_curtain)      # гасим экран только при реальном обновлении
                 stop_player()
                 download_content(
                     data.get("videos", []),
@@ -470,14 +470,13 @@ class App:
                 self.root.after(0, self.hide_curtain)
 
             elif status == 204:
-                global player_process
-                if player_process is None or player_process.poll() is not None:
-                    start_player(
-                        self.config['media_dir'],
-                        image_display_duration=self.config.get('image_display_duration', 5)
-                    )
+                # === ИСПРАВЛЕНИЕ ===
+                # Файлы полностью актуальны → НЕ трогаем плеер вообще
+                print(f"[{now_str}] Контент актуален (204). Продолжаем текущее воспроизведение без перезапуска.")
+                # Никакого start_player() и stop_player() здесь больше нет
 
             elif status == 401:
+                print(f"[{now_str}] Токен устарел (401). Запуск синхронизации...")
                 sync_token(self.config)
 
             elif status == 403:
