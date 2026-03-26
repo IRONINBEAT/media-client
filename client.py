@@ -3,7 +3,9 @@ import re
 import json
 import time
 import glob
+import socket
 import subprocess
+import tempfile
 import requests
 import tkinter as tk
 import threading
@@ -14,10 +16,14 @@ from urllib.parse import urlparse
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 DURATIONS_FILE = ".durations.json"
 PDF_PAGE_RE = re.compile(r'^(.+)_p-(\d+)\.png$')
-TRANSITION_CURTAIN_LEAD_TIME = 0.2
-PLAYER_WINDOW_SETTLE_TIME = 0.3
+VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
+MPV_SOCKET_TIMEOUT = 5
+MPV_EVENT_POLL_INTERVAL = 0.5
 
 player_process = None
+player_thread = None
+player_socket_path = None
 playback_stop_event = threading.Event()
 curtain_state_lock = threading.Lock()
 pending_curtain_state = None
@@ -37,8 +43,181 @@ def consume_curtain_request():
     return requested_state
 
 
+def cleanup_socket(socket_path):
+    if socket_path and os.path.exists(socket_path):
+        try:
+            os.unlink(socket_path)
+        except OSError:
+            pass
+
+
+def load_durations(media_dir, now):
+    durations = {}
+    durations_path = os.path.join(media_dir, DURATIONS_FILE)
+    if os.path.exists(durations_path):
+        try:
+            with open(durations_path, 'r') as f:
+                durations = json.load(f)
+            print(f"[Player {now}] Загружено {len(durations)} записей длительностей")
+        except Exception as e:
+            print(f"[Player {now}] Ошибка чтения .durations.json: {e}")
+    return durations
+
+
+def build_playlist_entries(media_dir, image_display_duration, now):
+    durations = load_durations(media_dir, now)
+    entries = []
+
+    for filename in sorted(os.listdir(media_dir)):
+        if filename == DURATIONS_FILE:
+            continue
+
+        filepath = os.path.join(media_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+
+        duration = durations.get(filename)
+        ext = os.path.splitext(filepath)[1].lower()
+
+        if duration is not None:
+            duration = float(duration)
+        elif ext in IMAGE_EXTENSIONS:
+            duration = float(image_display_duration)
+
+        entries.append({
+            "path": filepath,
+            "base": filename,
+            "ext": ext,
+            "duration": duration,
+        })
+
+    return entries
+
+
+def wait_for_mpv_socket(socket_path, process, timeout=MPV_SOCKET_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"mpv завершился с кодом {process.returncode} до открытия IPC-сокета")
+        if os.path.exists(socket_path):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"mpv не создал IPC-сокет за {timeout} сек.: {socket_path}")
+
+
+class MpvIpcClient:
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(MPV_EVENT_POLL_INTERVAL)
+        self.sock.connect(socket_path)
+        self.buffer = b""
+        self.request_id = 1
+        self.pending_events = []
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _read_line(self, timeout=None):
+        previous_timeout = self.sock.gettimeout()
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+
+        try:
+            while True:
+                if b'\n' in self.buffer:
+                    line, self.buffer = self.buffer.split(b'\n', 1)
+                    return line.decode('utf-8', errors='replace')
+
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("mpv IPC-соединение закрыто")
+                self.buffer += chunk
+        except socket.timeout:
+            return None
+        finally:
+            if timeout is not None:
+                self.sock.settimeout(previous_timeout)
+
+    def _read_message(self, timeout=None):
+        line = self._read_line(timeout=timeout)
+        if line is None:
+            return None
+        return json.loads(line)
+
+    def send_command(self, command, timeout=MPV_SOCKET_TIMEOUT):
+        current_request_id = self.request_id
+        self.request_id += 1
+
+        payload = {
+            "command": command,
+            "request_id": current_request_id,
+        }
+        message = json.dumps(payload, separators=(',', ':')).encode('utf-8') + b'\n'
+        self.sock.sendall(message)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = max(0.1, deadline - time.monotonic())
+            response = self._read_message(timeout=remaining)
+            if response is None:
+                raise TimeoutError(f"mpv IPC не ответил на команду {command[0]!r}")
+
+            if response.get("request_id") == current_request_id:
+                if response.get("error") != "success":
+                    raise RuntimeError(
+                        f"mpv IPC команда {command[0]!r} завершилась ошибкой: {response.get('error')}"
+                    )
+                return response.get("data")
+
+            if "event" in response:
+                self.pending_events.append(response)
+
+    def next_event(self, timeout=MPV_EVENT_POLL_INTERVAL):
+        if self.pending_events:
+            return self.pending_events.pop(0)
+
+        while True:
+            response = self._read_message(timeout=timeout)
+            if response is None:
+                return None
+            if "event" in response:
+                return response
+
+    def load_file(self, filepath, ext, duration):
+        options = {}
+        if duration is not None:
+            if ext in VIDEO_EXTENSIONS:
+                options["length"] = str(duration)
+            elif ext in IMAGE_EXTENSIONS:
+                options["image-display-duration"] = str(duration)
+
+        command = ["loadfile", filepath, "replace"]
+        if options:
+            command.extend([-1, options])
+        self.pending_events.clear()
+        self.send_command(command)
+
+    def wait_until_file_ends(self, process, stop_event):
+        while not stop_event.is_set():
+            if process.poll() is not None:
+                raise RuntimeError(f"mpv неожиданно завершился с кодом {process.returncode}")
+
+            event = self.next_event()
+            if event is None:
+                continue
+
+            if event.get("event") == "end-file":
+                return
+
+        raise RuntimeError("Воспроизведение остановлено")
+
+
 def stop_player():
-    global player_process
+    global player_process, player_thread, player_socket_path
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
     # Сигналим всем потокам остановки
@@ -52,9 +231,16 @@ def stop_player():
         except Exception as e:
             print(f"[Player {now}] Ошибка остановки mpv: {e}")
 
+    if player_thread and player_thread.is_alive() and player_thread is not threading.current_thread():
+        player_thread.join(timeout=2)
+    player_thread = None
+
+    cleanup_socket(player_socket_path)
+    player_socket_path = None
+
 
 def start_player(media_dir, image_display_duration=5):
-    global player_process
+    global player_process, player_thread, player_socket_path
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # Сначала гарантированно останавливаем всё старое
@@ -62,105 +248,79 @@ def start_player(media_dir, image_display_duration=5):
     playback_stop_event.clear()
 
     def _sequential_playback():
-        global player_process
+        global player_process, player_socket_path
         print(f"[Player {now}] Запущен последовательный плеер")
-
-        # Загружаем длительности один раз
-        durations = {}
-        durations_path = os.path.join(media_dir, DURATIONS_FILE)
-        if os.path.exists(durations_path):
-            try:
-                with open(durations_path, 'r') as f:
-                    durations = json.load(f)
-                print(f"[Player {now}] Загружено {len(durations)} записей длительностей")
-            except Exception as e:
-                print(f"[Player {now}] Ошибка чтения .durations.json: {e}")
-
-        # Собираем все файлы (кроме служебного)
-        all_files = []
-        for f in os.listdir(media_dir):
-            if f == DURATIONS_FILE:
-                continue
-            full = os.path.join(media_dir, f)
-            if os.path.isfile(full):
-                all_files.append(full)
-        all_files.sort()
-
-        if not all_files:
+        entries = build_playlist_entries(media_dir, image_display_duration, now)
+        if not entries:
             print(f"[Player {now}] Нет файлов для воспроизведения.")
             return
 
-        while not playback_stop_event.is_set():
-            for filepath in all_files:
-                if playback_stop_event.is_set():
-                    break
+        socket_path = os.path.join(tempfile.gettempdir(), f"media-client-mpv-{os.getpid()}.sock")
+        cleanup_socket(socket_path)
+        player_socket_path = socket_path
 
-                base = os.path.basename(filepath)
-                dur = durations.get(base)         
-                ext = os.path.splitext(filepath)[1].lower()
-                planned_duration = None
+        client = None
+        try:
+            player_process = subprocess.Popen(
+                [
+                    "mpv",
+                    "--fs",
+                    "--force-window=yes",
+                    "--idle=yes",
+                    "--no-osc",
+                    "--no-audio",
+                    "--no-terminal",
+                    f"--input-ipc-server={socket_path}",
+                    "--cursor-autohide=always",
+                    "--autofit-larger=100%x100%",
+                    "--keep-open=no",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
 
-                # Формируем команду ТОЛЬКО для одного файла
-                cmd = ["mpv", "--fs", "--no-osc", "--no-audio"]
+            wait_for_mpv_socket(socket_path, player_process)
+            client = MpvIpcClient(socket_path)
 
-                if dur is not None:
-                    if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
-                        planned_duration = float(dur)
-                        cmd.extend([f'--length={planned_duration}', filepath])
-                    else:
-                        planned_duration = float(dur)
-                        cmd.extend([f'--image-display-duration={planned_duration}', filepath])
-                else:
-                    # fallback только если в json почему-то нет записи
-                    if ext in ('.png', '.jpg', '.jpeg'):
-                        planned_duration = float(image_display_duration)
-                        cmd.extend([f'--image-display-duration={planned_duration}', filepath])
-                    else:
-                        cmd.append(filepath)
+            while not playback_stop_event.is_set():
+                for entry in entries:
+                    if playback_stop_event.is_set():
+                        break
 
-                print(f"[Player {now}] → {base}  длительность: {dur or image_display_duration} сек.")
+                    duration_text = entry["duration"] if entry["duration"] is not None else "native"
+                    print(f"[Player {now}] → {entry['base']}  длительность: {duration_text} сек.")
 
+                    try:
+                        client.load_file(entry["path"], entry["ext"], entry["duration"])
+                        client.wait_until_file_ends(player_process, playback_stop_event)
+                    except RuntimeError as e:
+                        if str(e) != "Воспроизведение остановлено":
+                            print(f"[Player {now}] Ошибка IPC/mpv для {entry['base']}: {e}")
+                        return
+                    except Exception as e:
+                        print(f"[Player {now}] Ошибка воспроизведения {entry['base']}: {e}")
+                        return
+        except Exception as e:
+            print(f"[Player {now}] Ошибка запуска mpv: {e}")
+        finally:
+            if client:
+                client.close()
+
+            proc = player_process
+            if proc and proc.poll() is None:
                 try:
-                    transition_started = False
-                    player_process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        preexec_fn=os.setsid
-                    )
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    pass
 
-                    playback_started_at = time.monotonic()
-
-                    # Ждём завершения этого файла или сигнала остановки
-                    while player_process.poll() is None:
-                        if playback_stop_event.is_set():
-                            try:
-                                os.killpg(os.getpgid(player_process.pid), signal.SIGTERM)
-                            except:
-                                pass
-                            break
-
-                        if planned_duration is not None and not transition_started:
-                            elapsed = time.monotonic() - playback_started_at
-                            if elapsed >= max(0, planned_duration - TRANSITION_CURTAIN_LEAD_TIME):
-                                request_curtain(True)
-                                transition_started = True
-                        time.sleep(0.1)
-
-                    if transition_started and not playback_stop_event.is_set():
-                        time.sleep(PLAYER_WINDOW_SETTLE_TIME)
-
-                    player_process = None
-
-                except Exception as e:
-                    print(f"[Player {now}] Ошибка запуска mpv для {base}: {e}")
-                    player_process = None
-                    time.sleep(0.5)
-                finally:
-                    request_curtain(False)
+            player_process = None
+            cleanup_socket(player_socket_path)
+            player_socket_path = None
 
     # Запускаем последовательное воспроизведение в отдельном потоке
-    threading.Thread(target=_sequential_playback, daemon=True).start()
+    player_thread = threading.Thread(target=_sequential_playback, daemon=True)
+    player_thread.start()
     print(f"[Player {now}] Последовательный плеер запущен")
 
 
