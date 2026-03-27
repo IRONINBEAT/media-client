@@ -1,0 +1,18 @@
+[Unit]
+Description=Media Client
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+WorkingDirectory=/home/<user>/media-client
+ExecStart=/home/<user>/media-client/my_venv/bin/python /home/<user>/media-client/client.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/<user>/.Xauthority
+
+[Install]
+WantedBy=graphical.target
