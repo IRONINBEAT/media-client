@@ -187,7 +187,17 @@ def suspend_until(target_dt, mode="freeze"):
         return False, "утилита rtcwake не найдена"
 
     wake_ts = int(target_dt.timestamp())
-    return run_system_command([rtcwake_path, "-m", mode, "-t", str(wake_ts)])
+    command = [rtcwake_path, "-m", mode, "-t", str(wake_ts)]
+    ok, info = run_system_command(command)
+    if ok:
+        return True, info
+
+    if "Permission denied" in info:
+        sudo_path = shutil.which("sudo")
+        if sudo_path:
+            return run_system_command([sudo_path] + command)
+
+    return False, info
 
 
 def cleanup_socket(socket_path):
