@@ -1,9 +1,13 @@
 {
     "server_url": "http://217.71.129.139:4085",
     "device_id": "NSTU_OrangePI2302",
-    "token": "_K6XVbKYohH7yMc6_lqiOzSS_qsBAZRj6HVSehBGKVKs5XYpyM4SJyJvDLmOaIjh",
+    "token": "YOUR_TOKEN_HERE",
     "media_dir": "./content",
     "heartbeat_interval": 30,
     "check_videos_interval": 180,
-    "image_display_duration": 5
+    "image_display_duration": 5,
+    "schedule": null,
+    "schedule_suspend_enabled": true,
+    "schedule_suspend_mode": "freeze",
+    "schedule_wakeup_margin_minutes": 2
 }

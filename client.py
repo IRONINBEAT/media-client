@@ -4,12 +4,14 @@ import json
 import time
 import glob
 import socket
+import shutil
 import subprocess
+import sys
 import tempfile
 import requests
 import tkinter as tk
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import signal
 from urllib.parse import urlparse
 
@@ -20,6 +22,7 @@ VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
 MPV_SOCKET_TIMEOUT = 5
 MPV_EVENT_POLL_INTERVAL = 0.1
+SCHEDULE_POWEROFF_MARGIN_MINUTES = 2
 
 player_process = None
 player_thread = None
@@ -41,6 +44,150 @@ def consume_curtain_request():
         requested_state = pending_curtain_state
         pending_curtain_state = None
     return requested_state
+
+
+def parse_hhmm(value):
+    if not isinstance(value, str):
+        raise ValueError("Ожидается строка времени HH:MM")
+
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Некорректный формат времени: {value}")
+
+    hours = int(parts[0])
+    minutes = int(parts[1])
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        raise ValueError(f"Время вне диапазона: {value}")
+
+    return hours, minutes
+
+
+def normalize_schedule(raw_schedule):
+    if raw_schedule in (None, "", {}):
+        return None
+
+    if not isinstance(raw_schedule, dict):
+        raise ValueError("schedule должен быть объектом")
+
+    start_time = raw_schedule.get("start_time")
+    end_time = raw_schedule.get("end_time")
+    parse_hhmm(start_time)
+    parse_hhmm(end_time)
+
+    return {
+        "start_time": start_time,
+        "end_time": end_time,
+    }
+
+
+def schedule_to_datetimes(schedule, now=None):
+    if schedule is None:
+        return None
+
+    now = now or datetime.now()
+    start_h, start_m = parse_hhmm(schedule["start_time"])
+    end_h, end_m = parse_hhmm(schedule["end_time"])
+
+    start_today = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    end_today = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+    is_24x7 = (start_h, start_m) == (end_h, end_m)
+
+    if is_24x7:
+        return {
+            "is_active": True,
+            "next_start": now,
+            "next_end": None,
+            "is_24x7": True,
+        }
+
+    if start_today < end_today:
+        is_active = start_today <= now < end_today
+        next_start = start_today if now < start_today else start_today + timedelta(days=1)
+        next_end = end_today if is_active else None
+    else:
+        is_active = now >= start_today or now < end_today
+        if is_active and now >= start_today:
+            next_end = end_today + timedelta(days=1)
+        elif is_active:
+            next_end = end_today
+        else:
+            next_end = None
+
+        if now < start_today and now >= end_today:
+            next_start = start_today
+        else:
+            next_start = start_today + timedelta(days=1)
+
+    return {
+        "is_active": is_active,
+        "next_start": next_start,
+        "next_end": next_end,
+        "is_24x7": False,
+    }
+
+
+def schedule_signature(schedule):
+    if not schedule:
+        return None
+    return f"{schedule['start_time']}-{schedule['end_time']}"
+
+
+def apply_schedule_to_config(config, raw_schedule):
+    try:
+        normalized = normalize_schedule(raw_schedule)
+    except ValueError as e:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[Schedule {now}] Некорректное расписание от сервера: {e}")
+        return config.get("schedule")
+
+    current = config.get("schedule")
+    if current != normalized:
+        config["schedule"] = normalized
+        save_config(config)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if normalized:
+            print(
+                f"[Schedule {now}] Новое расписание сохранено: "
+                f"{normalized['start_time']} - {normalized['end_time']}"
+            )
+        else:
+            print(f"[Schedule {now}] Расписание очищено.")
+
+    return normalized
+
+
+def is_linux():
+    return sys.platform.startswith("linux")
+
+
+def run_system_command(command):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as e:
+        return False, str(e)
+
+    if result.returncode == 0:
+        return True, result.stdout.strip()
+
+    error_text = result.stderr.strip() or result.stdout.strip() or f"код {result.returncode}"
+    return False, error_text
+
+
+def suspend_until(target_dt, mode="freeze"):
+    if not is_linux():
+        return False, "suspend через rtcwake поддерживается только на Linux"
+
+    rtcwake_path = shutil.which("rtcwake")
+    if not rtcwake_path:
+        return False, "утилита rtcwake не найдена"
+
+    wake_ts = int(target_dt.timestamp())
+    return run_system_command([rtcwake_path, "-m", mode, "-t", str(wake_ts)])
 
 
 def cleanup_socket(socket_path):
@@ -92,6 +239,18 @@ def build_playlist_entries(media_dir, image_display_duration, now):
         })
 
     return entries
+
+
+def has_playable_content(media_dir):
+    if not os.path.exists(media_dir):
+        return False
+
+    for filename in os.listdir(media_dir):
+        if filename == DURATIONS_FILE:
+            continue
+        if os.path.isfile(os.path.join(media_dir, filename)):
+            return True
+    return False
 
 
 def wait_for_mpv_socket(socket_path, process, timeout=MPV_SOCKET_TIMEOUT):
@@ -340,23 +499,40 @@ def load_config():
 
     # === ВАЛИДАЦИЯ ИНТЕРВАЛОВ ===
     defaults = {
-        "heartbeat_interval": 30,      # секунд
-        "check_videos_interval": 180,  # секунд (рекомендую 3 минуты)
-        "image_display_duration": 5,
-        "server_url": "http://217.71.129.139:4085",
-        "device_id": "NSTU_OrangePI2302",
-        "media_dir": "./content",
-        "token": ""
+        "heartbeat_interval": (30, (int, float)),
+        "check_videos_interval": (180, (int, float)),
+        "image_display_duration": (5, (int, float)),
+        "server_url": ("http://217.71.129.139:4085", (str,)),
+        "device_id": ("NSTU_OrangePI2302", (str,)),
+        "media_dir": ("./content", (str,)),
+        "token": ("", (str,)),
+        "schedule": (None, (dict, type(None))),
+        "schedule_poweroff_enabled": (False, (bool,)),
+        "schedule_suspend_enabled": (False, (bool,)),
+        "schedule_suspend_mode": ("freeze", (str,)),
+        "schedule_wakeup_margin_minutes": (SCHEDULE_POWEROFF_MARGIN_MINUTES, (int, float)),
     }
 
-    for key, default_value in defaults.items():
-        if key not in config or not isinstance(config[key], (int, float, str)):
+    for key, (default_value, allowed_types) in defaults.items():
+        if key not in config or not isinstance(config[key], allowed_types):
             print(f"[Config] Предупреждение: ключ '{key}' отсутствует или некорректен. Используем значение по умолчанию: {default_value}")
             config[key] = default_value
 
     # Ограничения на интервалы
     config["heartbeat_interval"] = max(15, min(120, int(config["heartbeat_interval"])))      # 15..120 сек
     config["check_videos_interval"] = max(60, min(600, int(config["check_videos_interval"]))) # 1..10 минут
+    config["image_display_duration"] = max(1, int(config["image_display_duration"]))
+    config["schedule_poweroff_enabled"] = bool(config["schedule_poweroff_enabled"])
+    if config["schedule_poweroff_enabled"] and not config["schedule_suspend_enabled"]:
+        config["schedule_suspend_enabled"] = True
+    config["schedule_wakeup_margin_minutes"] = max(0, min(60, int(config["schedule_wakeup_margin_minutes"])))
+    config["schedule_suspend_mode"] = str(config["schedule_suspend_mode"]).strip() or "freeze"
+
+    try:
+        config["schedule"] = normalize_schedule(config.get("schedule"))
+    except ValueError as e:
+        print(f"[Config] Предупреждение: расписание в конфиге некорректно: {e}. Игнорируем.")
+        config["schedule"] = None
 
     # Принудительно приводим media_dir к абсолютному пути
     if not os.path.isabs(config["media_dir"]):
@@ -367,6 +543,10 @@ def load_config():
     print(f"   Check videos       → {config['check_videos_interval']} сек")
     print(f"   Изображения по умолчанию → {config.get('image_display_duration', 5)} сек")
     print(f"   Media dir          → {config['media_dir']}")
+    if config.get("schedule"):
+        print(f"   Schedule           → {config['schedule']['start_time']} - {config['schedule']['end_time']}")
+    print(f"   Suspend by schedule  → {config['schedule_suspend_enabled']}")
+    print(f"   Suspend mode         → {config['schedule_suspend_mode']}")
 
     return config
 
@@ -583,6 +763,8 @@ class App:
         self.last_hb = 0
         self.last_check = 0
         self.is_blocked = False
+        self.schedule_state = None
+        self.last_power_action_key = None
 
     def show_curtain(self):
         self.root.deiconify()
@@ -591,6 +773,92 @@ class App:
     def hide_curtain(self):
         self.root.withdraw()
         self.root.update()
+
+    def start_player_if_needed(self):
+        global player_process
+        if not has_playable_content(self.config['media_dir']):
+            return
+
+        if player_process is None or player_process.poll() is not None:
+            start_player(
+                self.config['media_dir'],
+                image_display_duration=self.config.get('image_display_duration', 5)
+            )
+
+    def update_schedule(self, raw_schedule):
+        if raw_schedule is None and "schedule" not in self.config:
+            return
+        apply_schedule_to_config(self.config, raw_schedule)
+
+    def apply_schedule_state(self, now=None):
+        global player_process
+        now = now or datetime.now()
+        schedule = self.config.get("schedule")
+
+        if not schedule:
+            if self.schedule_state != "no-schedule":
+                print(f"[Schedule {now.strftime('%Y-%m-%d %H:%M:%S')}] Расписание не задано. Работаем без ограничений.")
+            self.schedule_state = "no-schedule"
+            self.last_power_action_key = None
+            return True
+
+        info = schedule_to_datetimes(schedule, now)
+        if info["is_active"]:
+            if self.schedule_state != "active":
+                if info["is_24x7"]:
+                    print(f"[Schedule {now.strftime('%Y-%m-%d %H:%M:%S')}] Режим 24/7 активен.")
+                else:
+                    print(
+                        f"[Schedule {now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"Входим в окно вещания до {info['next_end'].strftime('%Y-%m-%d %H:%M:%S')}."
+                    )
+                self.last_power_action_key = None
+                if not self.is_blocked:
+                    request_curtain(False)
+                    self.start_player_if_needed()
+            self.schedule_state = "active"
+            return True
+
+        next_start = info["next_start"]
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        previous_state = self.schedule_state
+        if previous_state != "inactive":
+            print(
+                f"[Schedule {now_str}] Вне окна вещания. "
+                f"Следующий старт: {next_start.strftime('%Y-%m-%d %H:%M:%S')}."
+            )
+        self.schedule_state = "inactive"
+        if player_process is not None or previous_state != "inactive":
+            stop_player()
+        request_curtain(True)
+
+        if self.config.get("schedule_suspend_enabled") and next_start is not None:
+            self.prepare_suspend_until(next_start, now)
+
+        return False
+
+    def prepare_suspend_until(self, next_start, now=None):
+        now = now or datetime.now()
+        power_key = next_start.isoformat()
+        if self.last_power_action_key == power_key:
+            return
+
+        self.last_power_action_key = power_key
+        wake_margin = self.config.get("schedule_wakeup_margin_minutes", SCHEDULE_POWEROFF_MARGIN_MINUTES)
+        wake_time = next_start - timedelta(minutes=wake_margin)
+        if wake_time <= now:
+            wake_time = next_start
+
+        now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        suspend_mode = self.config.get("schedule_suspend_mode", "freeze")
+        ok, info = suspend_until(wake_time, mode=suspend_mode)
+        if ok:
+            print(
+                f"[Schedule {now_str}] Устройство переведено в {suspend_mode} "
+                f"до {wake_time.strftime('%Y-%m-%d %H:%M:%S')}."
+            )
+        else:
+            print(f"[Schedule {now_str}] Не удалось перевести устройство в {suspend_mode}: {info}")
 
     def handle_blocked(self):
         if not self.is_blocked:
@@ -605,12 +873,10 @@ class App:
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[* {now}] Устройство разблокировано. Запуск воспроизведения.")
             self.is_blocked = False
-            start_player(
-                self.config['media_dir'],
-                image_display_duration=self.config.get('image_display_duration', 5)
-            )
-            time.sleep(2)
-            request_curtain(False)
+            if self.apply_schedule_state():
+                self.start_player_if_needed()
+                time.sleep(2)
+                request_curtain(False)
 
     def shutdown(self, *_):
         stop_player()
@@ -618,6 +884,7 @@ class App:
 
     def worker_loop(self):
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.apply_schedule_state()
         
         # Первая проверка контента сразу после старта
         print(f"[{now_str}] Начальная проверка контента после запуска...")
@@ -630,6 +897,7 @@ class App:
         while True:
             now_ts = time.time()
             now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            self.apply_schedule_state()
 
             # === HEARTBEAT ===
             if now_ts - self.last_hb >= self.config['heartbeat_interval']:
@@ -666,6 +934,10 @@ class App:
             resp = requests.post(url, json=payload, timeout=10)
             data = resp.json()
             status = data.get("status")
+            if "schedule" in data:
+                self.update_schedule(data.get("schedule"))
+            schedule_info = schedule_to_datetimes(self.config.get("schedule"), datetime.now()) if self.config.get("schedule") else None
+            is_schedule_active = schedule_info["is_active"] if schedule_info else True
 
             if status == 205:
                 print(f"[{now_str}] Обновление контента...")
@@ -676,26 +948,22 @@ class App:
                     self.config['media_dir'],
                     self.config.get('image_display_duration', 5)
                 )
-                start_player(
-                    self.config['media_dir'],
-                    image_display_duration=self.config.get('image_display_duration', 5)
-                )
-                time.sleep(3)
-                request_curtain(False)
+                if is_schedule_active and not self.is_blocked:
+                    self.start_player_if_needed()
+                    time.sleep(3)
+                    request_curtain(False)
 
             elif status == 204:
-                global player_process
-                if player_process is None or player_process.poll() is not None:
-                    start_player(
-                        self.config['media_dir'],
-                        image_display_duration=self.config.get('image_display_duration', 5)
-                    )
+                if is_schedule_active and not self.is_blocked:
+                    self.start_player_if_needed()
 
             elif status == 401:
                 sync_token(self.config)
 
             elif status == 403:
                 self.handle_blocked()
+
+            self.apply_schedule_state()
 
         except Exception as e:
             print(f"[{now_str}] Ошибка check_videos: {e}")
