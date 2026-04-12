@@ -1,13 +1,14 @@
 {
-    "server_url": "http://217.71.129.139:4085",
-    "device_id": "NSTU_OrangePI2302",
-    "token": "c!k<!&UDFzv)DEo?%2iqG9zzTQr@(+ITYcl)Lfs!j7ND#j(T97Wgh)N00x1MuiJF",
-    "media_dir": "./content",
+    "server_url": "",
+    "device_id": "TestingDevice",
+    "token": "",
+    "media_dir": "/content",
     "heartbeat_interval": 30,
     "check_videos_interval": 180,
     "image_display_duration": 5,
     "schedule": null,
-    "schedule_suspend_enabled": true,
+    "schedule_suspend_enabled": false,
     "schedule_suspend_mode": "freeze",
-    "schedule_wakeup_margin_minutes": 2
+    "schedule_wakeup_margin_minutes": 2,
+    "schedule_poweroff_enabled": false
 }
